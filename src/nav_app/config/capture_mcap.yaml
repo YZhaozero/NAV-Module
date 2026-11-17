@@ -1,0 +1,7 @@
+# Lossless bounded chunks for concurrent RGB-D, LiDAR, IMU and mapping on Jetson.
+compression: Zstd
+compressionLevel: Fast
+chunkSize: 4194304
+noChunkCRC: true
+noMessageIndex: false
+noSummary: false

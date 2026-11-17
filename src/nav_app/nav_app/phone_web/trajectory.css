@@ -1,0 +1,4 @@
+html,body{height:100%;margin:0;background:#071923;color:#d5e9ec;font:15px sans-serif;overflow:hidden}
+#map{height:100%;width:100%}
+#message{position:absolute;top:8px;left:8px;right:8px;max-height:45%;overflow:auto;background:#071923e8;border-radius:5px;padding:8px;pointer-events:none;white-space:pre-wrap}
+#message:empty{display:none}

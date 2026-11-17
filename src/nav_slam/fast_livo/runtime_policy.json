@@ -1,0 +1,4 @@
+{
+  "memory_policy_version": 1,
+  "features": ["visual_age_eviction", "bounded_input_queues", "pinned_lio_vio_image", "bounded_pcd_chunks", "patch_ownership", "no_automatic_respawn"]
+}

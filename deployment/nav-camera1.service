@@ -1,0 +1,14 @@
+[Unit]
+Description=WOOSH lossless camera1 receiver
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/nav-current
+Environment=ROS_DOMAIN_ID=0
+ExecStart=/bin/bash -c 'source %h/nav-current/scripts/runtime_environment.sh && exec python3 -m nav_app.woosh_camera_receiver'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.16)
+project(nav_cloud_self_filter)
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(PCL REQUIRED COMPONENTS filters)
+
+add_executable(cloud_self_filter src/cloud_self_filter.cpp)
+target_compile_features(cloud_self_filter PUBLIC cxx_std_17)
+ament_target_dependencies(cloud_self_filter rclcpp rcl_interfaces sensor_msgs pcl_conversions)
+target_include_directories(cloud_self_filter SYSTEM PRIVATE ${PCL_INCLUDE_DIRS})
+target_link_libraries(cloud_self_filter ${PCL_LIBRARIES})
+install(TARGETS cloud_self_filter DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(filter_contract test/test_filter.py TIMEOUT 35)
+endif()
+ament_package()

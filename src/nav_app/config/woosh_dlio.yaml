@@ -1,0 +1,20 @@
+# Matches WOOSH mid360_config.json for 192.168.128.3.
+# Source cloud is ALREADY transformed into base_footprint; IMU is still sensor-local.
+/**:
+  ros__parameters:
+    frames/odom: odom
+    frames/baselink: base_link
+    frames/lidar: base_footprint
+    frames/imu: woosh_livox3_imu
+    odom/odom_frame: odom
+    map/waitUntilMove: false
+    # Preserve detail before saving; a fine export cannot restore 25 cm voxels.
+    map/sparse/leafSize: 0.05
+    odom/preprocessing/voxelFilter/res: 0.05
+    odom/imu/approximateGravity: true
+    extrinsics/baselink2lidar/t: [0.0, 0.0, 0.0]
+    extrinsics/baselink2lidar/R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    extrinsics/baselink2imu/t: [0.338, 0.190, 0.330]
+    extrinsics/baselink2imu/R: [0.7071067811865476, -0.7071067811865476, 0.0,
+                               0.7071067811865476,  0.7071067811865476, 0.0,
+                               0.0,                 0.0,                1.0]

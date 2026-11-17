@@ -1,0 +1,9 @@
+/**:
+  ros__parameters:
+    enabled: true
+    expected_frame: base_footprint
+    # Measured near-body surface: X=0.365..0.451, Y=-0.224..0.222 m.
+    # The box also contains zero-range returns transformed to [0.429, 0, 0.605].
+    # No transform is applied here: the driver already publishes in base coordinates.
+    min: [0.34, -0.25, 0.30]
+    max: [0.48, 0.25, 1.65]

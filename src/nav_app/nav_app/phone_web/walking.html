@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>导航与建图</title><link rel="stylesheet" href="/walking.css"></head>
+<body>
+<header><button id="home" aria-label="返回首页">‹ 返回</button><strong>导航与建图</strong><nav aria-label="导航阶段"><span id="step-align">1 对齐</span><span id="step-plan">2 路线</span><span id="step-navigate">3 引导</span></nav><span class="live">实况</span></header>
+<main><div id="map" aria-label="百度地图"></div><canvas id="metric" aria-label="卫星与雷达轨迹"></canvas>
+<section id="summary" aria-live="polite"><strong id="headline">连接设备中…</strong><span id="subtitle">正在读取定位状态</span><span id="route-warning" hidden></span><span id="position-uncertainty" hidden></span><span id="assist-cue" hidden></span><div id="progress"><i></i></div></section>
+<div class="map-tools"><div class="map-style" role="group" aria-label="底图类型"><button id="map-street" aria-pressed="true" disabled>地图</button><button id="map-satellite" aria-pressed="false" disabled>卫星</button></div><button id="center" aria-label="回到我的位置">我的位置</button><button id="zoom-in" aria-label="放大">＋</button><button id="zoom-out" aria-label="缩小">−</button></div>
+<div class="legend"><span><i class="fixed"></i>固定解</span><span><i class="float"></i>浮点解</span><span id="fusion-legend" hidden><i style="background:#75c9ff"></i>手机融合</span><span><i class="lidar"></i>雷达轨迹</span></div>
+<button id="manual-place" disabled>手动定位</button>
+<div id="manual-crosshair" aria-hidden="true" hidden>＋</div>
+<div id="route-crosshair" aria-hidden="true" hidden>＋</div>
+<section id="route-editor" aria-label="选择途经点" hidden><span><b id="route-count">已选 0 个途经点</b><small>轻点加点 · 拖动移图</small></span><button id="route-add-center">添加十字处</button><button id="route-undo">撤销</button></section>
+<section id="manual-panel" aria-label="手动确认位置和方向" hidden>
+<p id="manual-hint">拖动地图，将十字对准当前位置</p>
+<div><button id="manual-north" aria-label="地图中心向北移动">↑</button><button id="manual-south" aria-label="地图中心向南移动">↓</button><button id="manual-west" aria-label="地图中心向西移动">←</button><button id="manual-east" aria-label="地图中心向东移动">→</button><button id="manual-cancel">取消</button><button id="manual-next" class="primary">确认位置</button></div>
+</section><button id="restart-tracking" hidden>恢复跟踪</button><span id="map-note" role="status">正在加载底图</span></main>
+<footer><button id="details">菜单</button><button id="secondary">相机 / 点云</button><button id="save" disabled>保存结束</button><button id="primary" class="primary" disabled>连接中</button></footer>
+<div id="shade" hidden></div><aside id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" hidden>
+<div class="sheet-head"><h2 id="sheet-title">行程菜单</h2><button id="close">完成</button></div>
+<nav class="portal-menu" aria-label="行程设置"><a href="/?tab=journey&amp;view=settings">录制设置</a><a href="/?tab=journey&amp;view=camera">相机与点云</a><a href="/?tab=device">设备设置</a></nav>
+<p id="detail-status"></p><section class="assist-details"><div class="field"><h3>路口辅助</h3><button id="route-assist" role="switch" aria-checked="false" aria-label="路口辅助" aria-describedby="assist-help" disabled><span>路口辅助</span><b id="assist-toggle-state">关</b></button></div><p id="assist-status">正在读取辅助状态</p><p id="assist-help" class="fine">根据规划路线和实际行进方向，提醒漏转、提前转弯或走错岔路。可随时开关，建图和基础引导继续。</p></section><div class="field"><label for="quality">对齐使用</label><select id="quality"><option value="fixed_float">固定解＋浮点解</option><option value="fixed">仅固定解</option></select></div>
+<p class="fine">固定解权重较高，浮点解较低；差分解和单点解不参与对齐。暂缺卫星时继续记录雷达轨迹。</p>
+<div class="field"><label for="phone-motion">手机定位来源</label><select id="phone-motion"><option value="native">原生差分解</option><option value="motion">手机融合近似对准</option></select></div><p id="phone-motion-status" class="fine">等待手机融合定位</p><p class="fine">近似对准使用连续运动确认方向，地理位置可能仍有米级至数十米偏差。“对齐使用”筛选原生卫星参考；融合估计会参考普通定位，不代表RTK固定解。方向对齐后由雷达连续跟踪，新的地理修正需通过独立核验。预测、重启和原点修正不计为移动。</p>
+<dl id="metrics"></dl><p id="speeds" class="fine"></p>
+<section id="route-tools" hidden><h3>步行路线</h3><div class="field"><label for="manual">规划方式</label><select id="manual"><option value="auto">百度步行规划</option><option value="manual">手动画线</option></select></div>
+<p class="fine" id="route-help">先关闭菜单，再在地图上轻点一次添加一个途经点；拖动只移动地图。也可把十字移到目标处，点击“添加十字处”。最后一个点是终点。没有步行道路时，可手动画线；请自行确认沿途可通行。</p><ol id="waypoints"></ol>
+<div class="row"><button data-action="current">当前位置</button><button data-action="loop">回到起点</button><button data-action="undo">撤销一点</button></div>
+<button id="plan" class="primary wide">规划步行路线</button></section>
+<div class="row"><button id="rtk">RTK参与定位：开</button><button id="replan">从当前位置重规划</button></div>
+<button id="overview" class="wide">查看整条路线与轨迹</button>
+<div class="row"><button data-action="satellites">卫星状态</button><button data-action="camera">相机 / 点云</button></div>
+<div class="row"><button id="back">返回行程</button><button id="discard" disabled>停止并保留数据</button></div>
+<p class="fine">轨迹拟合差表示两条轨迹的一致程度，不代表绝对定位精度。</p></aside>
+<div id="toast" role="status" hidden></div>
+<div id="confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title" hidden><div><h2 id="confirm-title">保存地图并结束采集？</h2><p>地图与本次选择的数据会一同整理，请保持通电。</p><div class="row"><button id="cancel-save">继续采集</button><button id="confirm-save" class="primary">保存并结束</button></div></div></div>
+<div id="confirm-restart" role="dialog" aria-modal="true" aria-labelledby="restart-title" hidden><div><h2 id="restart-title">恢复运动跟踪？</h2><p>保存本段地图和录包后重新开始运动跟踪；新的路段需要重新对齐，之前的数据保留。</p><div class="row"><button id="cancel-restart">暂不恢复</button><button id="confirm-restart-action" class="primary">保存本段并恢复</button></div></div></div>
+<div id="confirm-discard" role="dialog" aria-modal="true" aria-labelledby="discard-title" hidden><div><h2 id="discard-title">停止采集并保留已有数据？</h2><p>尚未保存的点云可能不完整，可稍后从未完成地图恢复。已选择的录制数据会继续收尾。</p><div class="row"><button id="cancel-discard">继续等待</button><button id="confirm-discard-action">停止并保留数据</button></div></div></div>
+<nav class="portal-tabs" aria-label="手机主导航"><a href="/" aria-current="page">行程</a><a href="/?tab=results">成果</a><a href="/?tab=device">设备</a></nav>
+<script src="/walking.js"></script></body></html>

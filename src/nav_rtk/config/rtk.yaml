@@ -1,0 +1,24 @@
+# 必须与 rtk.launch.py 中节点的 name="rtk_node" 保持一致。
+/rtk_node:
+  ros__parameters:
+    # 默认使用板载 ttyTHS1；可手动选择其他串口，不自动识别或切换。
+    port: /dev/ttyTHS1
+    baudrate: 230400
+    # 每次连接/恢复后开启已验证芯片的原始测量输出，持续保留 RX 与差分原字节。
+    record_raw_gnss: true
+
+    frame_topic: /rtk/frame
+    status_topic: /rtk/status
+
+    # 轮询频率只决定「新帧到发布」的最大延迟（20 ms），不代表数据率；
+    # 真实数据率由设备决定，实测约 20 Hz。
+    publish_rate_hz: 50.0
+    # 聚合状态里包含 WTRTK 帧没有的字段（卫星数、HDOP、fix_quality），
+    # 变化慢，用低频率发布即可。
+    status_rate_hz: 2.0
+
+    # 串口不可用时的重连间隔；拔掉设备不会让节点退出。
+    reconnect_interval_s: 2.0
+    warning_history: 50
+    # 每 200 帧打一条 info 日志，便于确认链路活着又不刷屏。
+    log_received_frames: true

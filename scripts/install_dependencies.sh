@@ -4,17 +4,17 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 workspace_root="$(cd -- "${script_dir}/.." && pwd)"
-dependencies_root="${GS_NAV_DEPS_ROOT:-${HOME}/gs_nav_dependencies}"
-jobs="${GS_NAV_BUILD_JOBS:-$(nproc)}"
+dependencies_root="${NAV_DEPS_ROOT:-${HOME}/nav_dependencies}"
+jobs="${NAV_BUILD_JOBS:-$(nproc)}"
 install_apt=1
 
 usage() {
   cat <<'EOF'
 Usage: ./scripts/install_dependencies.sh [options]
 
-Install GS-NAV system and source dependencies for Ubuntu 22.04 / ROS 2 Humble.
+Install NAV system and source dependencies for Ubuntu 22.04 / ROS 2 Humble.
 Source packages, build trees, and user-installed artifacts are kept outside the
-GS-NAV workspace (default: ~/gs_nav_dependencies). GTSAM 4.2 is installed as
+NAV workspace (default: ~/nav_dependencies). GTSAM 4.2 is installed as
 system packages from the official BorgLab Launchpad PPA.
 
 Options:
@@ -24,7 +24,7 @@ Options:
   -h, --help        Show this help
 
 Environment equivalents:
-  GS_NAV_DEPS_ROOT, GS_NAV_BUILD_JOBS
+  NAV_DEPS_ROOT, NAV_BUILD_JOBS
 EOF
 }
 
@@ -65,7 +65,7 @@ dependencies_root="$(realpath -m -- "${dependencies_root}")"
 case "${dependencies_root}" in
   /|"${HOME}"|"${workspace_root}"|"${workspace_root}"/*)
     echo "Refusing unsafe dependency directory: ${dependencies_root}" >&2
-    echo "Choose a dedicated directory outside the GS-NAV workspace." >&2
+    echo "Choose a dedicated directory outside the NAV workspace." >&2
     exit 2
     ;;
 esac
@@ -74,12 +74,12 @@ source_root="${dependencies_root}/src"
 build_root="${dependencies_root}/build"
 native_install="${dependencies_root}/install"
 ros_workspace="${dependencies_root}/ros2_ws"
-marker="${dependencies_root}/.gs_nav_dependencies"
+marker="${dependencies_root}/.nav_dependencies"
 
 if [[ -e "${dependencies_root}" && ! -f "${marker}" ]]; then
   echo "The target exists but is not managed by this installer:" >&2
   echo "  ${dependencies_root}" >&2
-  echo "Use an empty path or set GS_NAV_DEPS_ROOT to another directory." >&2
+  echo "Use an empty path or set NAV_DEPS_ROOT to another directory." >&2
   exit 2
 fi
 
@@ -241,7 +241,7 @@ prepend_path() {
 
 echo "[5/6] Building ROS 2 third-party packages in the external underlay..."
 for package in fast_gicp ndt_omp_ros2 scancontext_ros2; do
-  source_package="${workspace_root}/src/gs_nav_localization/thirdrepo/${package}"
+  source_package="${workspace_root}/src/nav_localization/thirdrepo/${package}"
   target_package="${ros_workspace}/src/${package}"
   [[ -d "${source_package}" ]] || {
     echo "Missing vendored dependency source: ${source_package}" >&2
@@ -271,7 +271,7 @@ echo "[6/6] Writing reusable environment setup..."
 setup_file="${dependencies_root}/setup.bash"
 {
   printf '%s\n' '#!/usr/bin/env bash'
-  printf 'export GS_NAV_DEPS_ROOT=%q\n' "${dependencies_root}"
+  printf 'export NAV_DEPS_ROOT=%q\n' "${dependencies_root}"
   printf '%s\n' 'source /opt/ros/humble/setup.bash'
   printf 'export CMAKE_PREFIX_PATH=%q:"${CMAKE_PREFIX_PATH:-}"\n' "${native_install}"
   printf 'export LD_LIBRARY_PATH=%q/lib:"${LD_LIBRARY_PATH:-}"\n' "${native_install}"
@@ -286,7 +286,7 @@ test -r "${native_install}/lib/cmake/teaserpp/teaserppConfig.cmake"
 test -r "${ros_workspace}/install/setup.bash"
 
 echo
-echo "GS-NAV dependencies are ready in: ${dependencies_root}"
+echo "NAV dependencies are ready in: ${dependencies_root}"
 echo "Next steps:"
 echo "  source ${setup_file}"
 echo "  ${workspace_root}/build.sh"

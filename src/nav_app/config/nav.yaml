@@ -1,0 +1,43 @@
+# 必须与 ar_nav.launch.py 中 Qt 节点的 name="nav_qt_nav" 保持一致。
+/nav_qt_nav:
+  ros__parameters:
+    # 实机使用系统时钟；仿真或录包回放可由 launch 参数覆盖。
+    use_sim_time: false
+    camera_topic: /camera/camera/color/image_raw
+    camera_info_topic: /camera/camera/color/camera_info
+    # 直接使用导航 map_server 发布的同一份栅格地图。
+    map_topic: /map
+    # Nav2 默认全局路径；兼容旧 TEB/global_planner 的 /global_plan。
+    path_topic: /plan
+    path_topic_fallbacks:
+      - /global_plan
+    # 可选：订阅实时 PointCloud2 作为点云地图；留空时只使用本地 PCD/PLY。
+    pointcloud_topic: ""
+    # 程序启动时自动加载的 PCD/PLY；也可在界面中点击“加载 PCD/PLY”重新选择。
+    # ar_nav.launch.py 默认传入包内 maps/dilo_map.pcd；设为空可禁用启动时加载。
+    pointcloud_map_path: ""
+    # 所有 PCD/PLY 与 Nav2 YAML/PGM 的统一默认保存目录。
+    # 留空时使用 ~/nav_maps；Jetson 默认 /home/nvidia/nav_maps。
+    map_storage_dir: ""
+
+    map_frame: map
+    base_frame: base_link
+    # 留空时使用相机图像 header.frame_id；也可直接填写 camera_color_optical_frame。
+    camera_frame: ""
+
+    # auto: 优先 CameraInfo + TF 标定投影，缺失时回退到可调地面投影。
+    # calibrated: 只允许标定投影；ground: 强制使用地面投影。
+    projection_mode: auto
+    route_width_m: 0.95
+    # base_footprint 应为与当地地面平行的机身地面参考系。
+    ground_frame: base_footprint
+    # 无该 TF 时使用 map 水平面及此机身高度，需按本机实测核对。
+    ground_height_m: 0.72
+    ground_render_offset_m: 0.015
+    route_near_clip_m: 0.45
+    route_far_clip_m: 15.0
+    camera_height_m: 0.72
+    horizon_ratio: 0.43
+
+    # 屏幕任一边小于 700 像素时自动使用紧凑布局并全屏显示。
+    fullscreen_on_small_screen: true

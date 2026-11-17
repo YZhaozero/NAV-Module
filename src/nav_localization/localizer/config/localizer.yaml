@@ -1,0 +1,50 @@
+# NAV navigation integration
+cloud_topic: /dlio/odom_node/pointcloud/deskewed
+odom_topic: /dlio/odom_node/odom
+map_frame: map
+local_frame: odom
+update_hz: 1.0
+default_map_path: /home/zy/ws/NAV-Module/src/nav_map/nav_map_20260918_105125_413.pcd
+
+# Coarse GICP: rejects converged-but-poor matches by fitness score.
+rough_scan_resolution: 0.2
+rough_map_resolution: 0.15
+rough_max_iteration: 30
+rough_score_thresh: 1.0
+
+# Fine GICP
+refine_scan_resolution: 0.05
+refine_map_resolution: 0.05
+refine_max_iteration: 100
+refine_score_thresh: 0.1
+correspondence_randomness: 20
+maximum_optimizer_iterations: 30
+
+# TEASER++ fallback when Scan Context cannot produce a valid candidate.
+use_global_registration: true
+global_voxel_size: 0.2
+global_feature_radius: 2.0
+global_score_thresh: 5.0
+
+# Scan Context ROS 2 parameters.
+# Startup-only parameters: changing these requires restarting localizer because
+# they affect SC database loading/generation. The generated cache is <map>.sc.
+use_scan_context: true
+sc_max_radius: 80.0
+sc_grid_resolution: 2.0
+
+# Runtime parameters: these can be changed with `ros2 param set` and take
+# effect on the next global relocalization.
+sc_dist_thresh: 0.5
+sc_similar_candidates_thresh: 0.1
+sc_max_candidates: 10
+sc_enable_early_exit: false
+
+# Map-specific vertical correction is opt-in; never assume a fixed ground Z.
+enable_ground_z_correction: false
+map_ground_z: 0.0
+max_ground_z_correction: 0.5
+
+# Diagnostic query-cloud capture
+save_clouds: false
+save_clouds_dir: /tmp/localizer_clouds/

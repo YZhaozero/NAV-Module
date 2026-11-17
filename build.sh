@@ -4,7 +4,7 @@ set -euo pipefail
 
 workspace_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 workspace_install="${workspace_root}/install"
-dependencies_root="${GS_NAV_DEPS_ROOT:-${HOME}/gs_nav_dependencies}"
+dependencies_root="${NAV_DEPS_ROOT:-${HOME}/nav_dependencies}"
 dependencies_setup="${dependencies_root}/setup.bash"
 
 # A terminal that has already sourced this workspace treats the previous
@@ -53,9 +53,9 @@ if [[ -r "${dependencies_setup}" ]]; then
   source "${dependencies_setup}"
 else
   printf '%s\n' \
-    "[GS-NAV] Warning: external dependencies setup was not found:" \
+    "[NAV] Warning: external dependencies setup was not found:" \
     "         ${dependencies_setup}" \
-    "         Run ${workspace_root}/scripts/install_dependencies.sh first."
+    "         Using installed ROS/system dependencies; CMake reports missing packages."
 fi
 set -u
 cd "${workspace_root}"
@@ -70,8 +70,8 @@ build_arguments=(
 
 # These packages are copied and built as an external underlay by the dependency
 # installer. Ignore the vendored copies here so their artifacts do not end up in
-# this workspace. Set GS_NAV_BUILD_BUNDLED_THIRDPARTY=1 only for offline fallback.
-if [[ "${GS_NAV_BUILD_BUNDLED_THIRDPARTY:-0}" != "1" ]]; then
+# this workspace. Set NAV_BUILD_BUNDLED_THIRDPARTY=1 only for offline fallback.
+if [[ "${NAV_BUILD_BUNDLED_THIRDPARTY:-0}" != "1" ]]; then
   build_arguments+=(
     --packages-ignore
       fast_gicp
@@ -80,7 +80,7 @@ if [[ "${GS_NAV_BUILD_BUNDLED_THIRDPARTY:-0}" != "1" ]]; then
   )
 fi
 
-printf '%s\n' "[GS-NAV] Building workspace: ${workspace_root}"
-printf '%s\n' "[GS-NAV] Dependency root:   ${dependencies_root}"
+printf '%s\n' "[NAV] Building workspace: ${workspace_root}"
+printf '%s\n' "[NAV] Dependency root:   ${dependencies_root}"
 
 exec colcon build "${build_arguments[@]}" "$@"

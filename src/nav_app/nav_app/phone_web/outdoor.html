@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#102c2b"><title>NAV · 地图与路线</title><link rel="stylesheet" href="/outdoor.css"><script src="/baidu_map.js" defer></script><script src="/outdoor.js" defer></script></head>
+<body><header><a href="/">‹ 设备屏幕</a><strong>地图与路线</strong><span id="connection" role="status">连接中</span></header>
+<main><section class="map-shell"><div id="map" aria-label="百度地图，选择起点和终点"></div><div class="map-actions"><button id="campus">机械学院附近</button><button id="locate">我的位置</button><button id="heading" aria-pressed="true">朝向跟随</button><button id="satellite" aria-pressed="false">卫星图</button></div><p id="map-message" role="status">正在加载百度地图…</p><div id="simulation-banner" hidden>模拟演示 · 非真实定位</div><div class="legend"><span>● 计划路线</span><span id="position-legend">● 实际位置</span><span id="heading-status">方向待确认</span></div></section>
+<section class="panel"><div class="state"><span class="eyebrow">设备定位</span><strong id="position-status">等待定位数据</strong><p id="alignment-status">当前位置确认后可开始引导</p></div>
+<div id="guide" hidden><strong id="remaining"></strong><p id="direction"></p></div>
+<details id="simulation-panel"><summary>模拟演示</summary><p class="hint">先保存路线，再从起点模拟行走。速度为 3 米/秒，演示轨迹不计入实录数据。</p><button id="sim-enter">从路线起点模拟</button><div id="sim-controls" hidden><div class="row"><button data-sim="walk">模拟行走</button><button data-sim="pause">暂停模拟</button></div><div class="row"><button data-sim="offroute">模拟偏航</button><button data-sim="lost">模拟定位中断</button><button data-sim="recover">恢复模拟定位</button></div><div class="row"><button data-sim="restart">回到起点</button><button data-sim="exit">退出模拟</button></div></div></details>
+<details id="geo-panel"><summary>已建地图与定位</summary><p id="geo-status" role="status">正在读取地图…</p><label for="geo-map">定位地图</label><select id="geo-map"><option value="">首次采集（无预建地图）</option></select><div class="row"><button id="geo-select">使用此地图</button><button id="geo-start">启动地图定位</button><button id="geo-stop">停止地图定位</button></div><button id="geo-anchor">关联卫星地理位置</button><button id="geo-confirm" hidden>已核对位置，继续引导</button><p class="hint">已建地图在无卫星信号时也可定位。地图尚未绑定地理位置时，可先用于地图内导航；获得可信卫星对齐后，再关联到百度底图。</p></details>
+<details id="journey-panel"><summary>全程路线 · 道路与已建地图</summary>
+<p id="journey-status" role="status">先登记地点和入口，再规划全程路线</p>
+<label for="journey-start">出发地点</label><select id="journey-start"></select><label for="journey-end">目的地点</label><select id="journey-end"></select>
+<div class="row"><button id="journey-plan">规划全程</button><button data-journey="start">开始全程引导</button><button data-journey="stop">结束全程引导</button></div>
+<div id="journey-transition" hidden><p>到达入口后，确认下一段定位再继续。</p><button data-journey="switch">切换下一段地图</button><button data-journey="confirm">已确认入口位置，继续</button></div>
+<details><summary>登记地点与入口</summary><label for="place-name">地点名称</label><input id="place-name" maxlength="80" placeholder="例如：东门、会议室">
+<div class="row"><button id="place-local">登记设备当前地图位置</button><button id="place-road">登记百度地图选定终点</button></div>
+<p class="hint">选择上方的两个地点：地图内路线自动避开障碍和未知区域；跨地图入口须确认两处标记是同一可通行入口的两侧。</p>
+<label><input type="checkbox" id="portal-confirm">这两个地点连接同一可通行入口，已核对位置</label>
+<div class="row"><button id="portal-link">登记入口连接</button><button id="road-link">将已保存道路连接这两个地点</button></div>
+</details></details>
+<p><a href="/">在已建地图中选择目的地 →</a></p><form id="search"><label for="origin">起点</label><input id="origin" maxlength="80" placeholder="地图选点，或输入完整地点名称"><label for="destination">终点</label><input id="destination" maxlength="80" placeholder="地图选点，或输入完整地点名称"><button type="submit" id="plan" class="primary">规划步行路线</button></form>
+<div class="row"><button id="pick-start">选起点</button><button id="pick-end">选终点</button><button id="draw" aria-pressed="false">手动画线</button><button id="undo">撤销一点</button></div>
+<label for="title">路线名称</label><input id="title" maxlength="80" value="路网路线"><p id="route-summary">还没有路线。可在地图上选点，也可搜索地点。</p>
+<div class="row"><button id="save-route">保存路线</button><button id="start" class="primary">开始引导</button><button id="stop">结束引导</button></div>
+<p id="message" role="alert"></p><div class="row"><button id="save-track">保存实走轨迹</button><a href="/outdoor/export" download>导出路线与轨迹</a></div>
+<p class="hint">蓝线是计划路线，绿点是设备位置。方向以地图正北为参考；定位失效时暂停指引。建图与录包请返回“设备屏幕 → 采集建图”。</p>
+<p class="hint">地图加载、算路和位置上图需要联网，并调用百度地图服务。路网路线供人步行参考，机器人请使用设备内的地图导航。</p></section></main></body></html>

@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0b1820"><title>NAV · 手机遥控</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header><a href="/navigation" style="color:inherit;text-decoration:none;min-height:44px;display:flex;align-items:center">‹ 导航</a><strong>NAV 设备遥控</strong><span id="connection" role="status">等待配对</span></header>
+<main>
+<section id="pairing"><h1>连接导航设备</h1><p>手机连接设备热点，或与设备连接同一个 Wi-Fi，再输入设备屏幕上的 6 位配对码。</p><form id="pair-form"><label for="code">配对码</label><input id="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" required placeholder="6 位数字"><button type="submit">连接设备</button></form><p class="muted">连接后，手机和设备操作的是同一个界面。</p></section>
+<section id="remote" hidden><div id="remote-shell"><div id="remote-stage"><div id="screen-wrap"><img id="screen" alt="设备当前画面，可触摸操作" draggable="false"><div id="blocked">正在获取设备画面…</div></div><p id="feedback" role="status"></p><nav aria-label="画面操作"><button id="fit">放大画面</button><button id="landscape" aria-pressed="false">横屏操作</button><button id="keyboard">用手机键盘输入</button><button id="escape">返回弹窗</button><button id="disconnect">断开连接</button></nav><form id="text-form" hidden><label for="text">填写新内容，确认后替换设备当前输入</label><input id="text" maxlength="512" autocomplete="off"><button type="button" id="reveal-input" hidden>显示密码</button><button type="submit">填写并确认</button><button type="button" id="enter">确认设备输入</button><button type="button" id="backspace">删除一字</button></form></div></div><p class="muted">轻点操作，拖动地图或列表；点击“横屏操作”可横向使用，画面下方可随时退出或打开键盘。机器人任务仍需在设备界面确认执行。断线会请求取消由手机发起的机器人任务，停止状态以设备确认为准。</p></section>
+<p><a href="/navigation">打开地图与路线 →</a></p>
+<p id="message" role="alert"></p><p class="muted">短暂断网或锁屏后会自动恢复画面，采集在设备上继续。配对保留 8 小时；更换手机请在设备“手机遥控”中断开并换码。</p>
+</main></body></html>

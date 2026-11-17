@@ -1,0 +1,30 @@
+# Defaults for both `colcon build` and ./build.sh from the workspace root.
+# Sources remain in src; Nav2 is supplied by the ROS Humble underlay.
+build:
+  base-paths:
+    - src/nav_app
+    - src/nav_rtk
+    - src/nav_driver
+    - src/nav_slam
+    - src/nav_localization/interface
+    - src/nav_localization/localizer
+    - src/nav_localization/icp_registration
+    - src/nav_localization/manual_relocalization_tool
+    - src/nav_sensor_proc
+    - src/nav_navgation/SCAN-Planner-Ros2
+  packages-up-to:
+    - nav_app
+  executor: sequential
+  symlink-install: true
+  allow-overriding:
+    - realsense2_camera
+    - realsense2_camera_msgs
+    - realsense2_description
+  cmake-args:
+    - -GNinja
+    - -DBUILD_TESTING=OFF
+    - -DCMAKE_POLICY_DEFAULT_CMP0074=NEW
+    - -DPCL_ROOT=/usr
+    - -DCMAKE_JOB_POOLS=compile=2;link=1
+    - -DCMAKE_JOB_POOL_COMPILE=compile
+    - -DCMAKE_JOB_POOL_LINK=link

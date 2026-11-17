@@ -1,0 +1,23 @@
+[Unit]
+Description=NAV mapping and navigation application
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h/nav-current
+ExecStart=/bin/bash %h/nav-current/scripts/start_device_app.sh
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=930
+MemoryAccounting=yes
+MemoryHigh=5G
+MemoryMax=6G
+MemorySwapMax=512M
+LimitCORE=0
+
+[Install]
+WantedBy=graphical-session.target

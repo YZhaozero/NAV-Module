@@ -1,0 +1,20 @@
+# Shared robot mapping/navigation capture protocol. Override with NAV_CAPTURE_CONFIG.
+schema_version: 1
+algorithm: raw_sensor_capture
+ros_package: nav_app
+depth_alignment: offline
+roles:
+  rgb: /camera/camera/color/image_raw
+  camera_info: /camera/camera/color/camera_info
+  lidar: /livox/lidar
+  imu: /livox/imu
+  depth: /camera/camera/depth/image_rect_raw
+  aligned_depth: /camera/camera/aligned_depth_to_color/image_raw
+  depth_to_color: /camera/camera/extrinsics/depth_to_color
+required_roles: [lidar, imu]
+max_silence_s: 2.0
+# Quality review warnings; these do not establish localization accuracy.
+warning_max_gap_by_role_s: {imu: 0.05, lidar: 0.3, rgb: 0.25, depth: 0.15, aligned_depth: 0.25}
+# Time offsets are read from live algorithm parameters, not assumed here.
+# Raw stamps stay raw; CameraInfo and static TF are recorded without alteration.
+parameter_nodes: [/dlio_odom_node, /dlio_map_node, /camera/camera, /parameter_blackboard, /laserMapping, /localizer/localizer_node, /livox_lidar_publisher]
