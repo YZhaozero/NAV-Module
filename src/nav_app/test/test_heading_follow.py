@@ -31,6 +31,13 @@ def test_follow_places_forward_above_device_and_picks_original_coordinates(panel
     assert center.y() == pytest.approx(288.)
     assert ahead.x() == pytest.approx(center.x(), abs=1e-5)
     assert ahead.y() < center.y()
+    from types import SimpleNamespace
+    arrows = []
+    panel._draw_robot(SimpleNamespace(setPen=lambda _: None, setBrush=lambda _: None,
+                                      drawPolygon=arrows.append))
+    tip = arrows[0][0]
+    assert tip.x() == pytest.approx(center.x())
+    assert tip.y() < center.y()
     np.testing.assert_allclose(panel.widget_to_world(ahead),
                                pose + [math.cos(yaw), math.sin(yaw)], atol=1e-6)
 
@@ -38,9 +45,11 @@ def test_follow_places_forward_above_device_and_picks_original_coordinates(panel
 def test_lost_pose_cannot_retain_a_trusted_arrow(panel):
     panel.set_navigation_follow(True)
     panel.set_navigation_state(None, np.array([1., 2.]), 1.)
+    viewport = panel._map_follow_transform()
+    assert not viewport.isIdentity()
     panel.set_navigation_state(None, None, 0.)
     assert panel._robot_xy is None
-    assert panel._map_follow_transform().isIdentity()
+    assert panel._map_follow_transform() == viewport
     panel.set_navigation_state(None, np.array([1., np.nan]), 0.)
     assert panel._robot_xy is None
     panel.set_navigation_state(None, np.array([1., 2.]), float('inf'))
@@ -98,8 +107,8 @@ def test_cloud_display_reconfiguration_preserves_follow_direction():
     view.set_navigation_state(None,np.array([1.,2.]),.4)
     view.set_navigation_follow(True)
     try:
-        for alignment in ('original','auto'):
-            view.set_cloud_display_options(alignment,'XYZ',(False,False,False),'perspective','height')
+        for projection in ('perspective', 'orthographic'):
+            view.set_cloud_display_options('original','XYZ',(False,False,False),projection,'height')
             xy=np.array([[1.,2.],np.array([1.,2.])+[math.cos(.4),math.sin(.4)]])
             sx,sy,_=view._project_cloud_points(view._cloud_ground_points_from_xy(xy))
             assert sx[0]==pytest.approx(400.,abs=1e-4)

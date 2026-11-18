@@ -76,10 +76,12 @@ class NavigationStackPage(QWidget):
         camera_arguments: Callable[[], list],
         localization_tools: LocalizationToolsController,
         robot_profile: str = "",
+        operating_mode: str = "robot",
     ) -> None:
         super().__init__()
         self.controller = controller
         self.robot_profile = robot_profile
+        self.operating_mode = operating_mode
         self.map_storage_dir = Path(map_storage_dir)
         self.lidar_arguments = lidar_arguments
         self.camera_arguments = camera_arguments
@@ -87,6 +89,8 @@ class NavigationStackPage(QWidget):
         self.component_status = {}
         self.access_settings = {}
         self._build_ui()
+        if operating_mode == "walking":
+            self.navigation_backend.setCurrentIndex(self.navigation_backend.findData("walking"))
         if robot_profile == "woosh":
             self.dlio_pointcloud_topic.setText("/foo/livox/lidar_192_168_128_3")
             self.dlio_imu_topic.setText("/foo/livox/imu_192_168_128_3")
@@ -695,8 +699,10 @@ class NavigationStackPage(QWidget):
             backend.description if backend is not None else "")
 
     def _update_navigation_backend(self, index: int) -> None:
-        self.navigation_backend_stack.setCurrentIndex(index)
         key = self.navigation_backend.itemData(index)
+        self.nav2_params.setPlaceholderText("留空使用仅规划参数" if key == "walking" else "留空使用 nav2_bringup 默认参数")
+        self.nav2_rviz.setEnabled(key != "walking")
+        self.navigation_backend_stack.setCurrentIndex({"nav2": 0, "walking": 0, "scan_planner": 1, "custom": 2}[key])
         backend = NAVIGATION_BACKENDS.get(key)
         self.navigation_backend_description.setText(
             backend.description if backend is not None else "")
@@ -838,7 +844,7 @@ class NavigationStackPage(QWidget):
             combo = getattr(self, key)
             combo.setCurrentIndex(combo.findData(values[key]))
             combo.setEnabled(False)
-        self.navigation_backend.setCurrentIndex(self.navigation_backend.findData("nav2"))
+        self.navigation_backend.setCurrentIndex(self.navigation_backend.findData("walking" if self.operating_mode == "walking" else "nav2"))
         self.navigation_backend.setEnabled(False)
         for key, field in (("lidar_topic", self.dlio_pointcloud_topic),
                            ("fast_livo_lidar_topic", self.fast_livo_lidar_topic),
@@ -856,12 +862,12 @@ class NavigationStackPage(QWidget):
             dlio="里程计 · " + {"external": "已有 Odometry", "fast_livo": "FAST-LIVO2", "dlio": "DLIO"}[values["odometry_backend"]],
             laserscan="避障 scan · " + ("已有 LaserScan" if values["scan_source"] == "external" else "点云转换"),
             localizer="地图定位 · " + {"amcl": "AMCL", "external": "已有 TF", "pointcloud_localizer": "点云 Localizer"}[values["localization_backend"]],
-            nav2="统一导航 · Nav2")
+            nav2="路线规划 · Nav2" if self.operating_mode == "walking" else "统一导航 · Nav2")
         for index, key in enumerate(START_ORDER, start=1):
             self.component_names[key].setText(f"{index}. {names[key]}")
         for key, state in self.controller.states.items():
             self._handle_component_state(key, state)
-        self.action_status.setText("接入设置已应用；导航后端统一为 Nav2，底盘执行许可保持原配置。")
+        self.action_status.setText("接入设置已应用；仅规划路线，使用手柄控制行走。" if self.operating_mode == "walking" else "接入设置已应用；导航后端统一为 Nav2，底盘执行许可保持原配置。")
 
     def start_stack(self) -> tuple[bool, str]:
         config = self.configuration()

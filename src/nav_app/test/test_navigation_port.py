@@ -83,7 +83,7 @@ def test_stale_localization_blocks_robot_goal_and_requests_cancel():
         get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=10_000_000_000)),
         navigation_route_ready=lambda: True,
         poll_navigation=lambda: None,
-        navigation_active=True, cancel_navigation=lambda: cancelled.append(True), _route_wait_status=None)
+        navigation_active=True, operating_mode="robot", cancel_navigation=lambda: cancelled.append(True), _route_wait_status=None)
     assert not QtNavRosNode.send_navigation_waypoints(node, [np.array([1., 2.])])
     assert "定位" in node.navigation_status
     QtNavRosNode._monitor_localization(node)

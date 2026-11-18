@@ -188,3 +188,18 @@ def test_single_touch_and_touch_cancel_request_zero(page, application):
     assert transport.commands[-1][0] > 0
     application.sendEvent(stick, QTouchEvent(QEvent.TouchCancel, device))
     assert not stick.held and transport.commands[-1] == ZERO
+
+
+def test_calibration_keeps_button_press_and_release_between_ui_refreshes(page, window, monkeypatch):
+    view, transport = page
+    pad, _calls = attach_gamepad(view, window, monkeypatch)
+    pad.receive(SimpleNamespace(axes=[0., 0., 0., 0.], buttons=[0, 0, 0]))
+    pad.begin()
+    pad.record_center()
+    pad.receive(SimpleNamespace(axes=[0., 0., 0., 0.], buttons=[0, 1, 0]))
+    pad.receive(SimpleNamespace(axes=[0., 0., 0., 0.], buttons=[0, 0, 0]))
+    assert pad.calibration.deadman == 1
+    assert pad.calibration.stage == "axis"
+    view.tick()
+    assert "最近按下 [1]" in pad.live.text()
+    assert transport.commands == [] and not view.policy.armed

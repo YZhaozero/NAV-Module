@@ -31,7 +31,7 @@ class NavigationAccessPage(QWidget):
         self.presets = QComboBox()
         self.presets.addItem("WOOSH · 桥接传感器 + FAST-LIVO", "woosh")
         if self.profile == "woosh":
-            self.presets.addItem("WOOSH · .5 雷达 + 自带相机", "woosh_native5")
+            self.presets.addItem("WOOSH · .5 雷达＋IMU + 相机融合", "woosh_native5")
         self.presets.addItem("已有 scan + 里程计 · AMCL 定位", "external")
         self.presets.addItem("本机驱动 + 点云处理", "local")
         presets.addWidget(self.presets, 1)

@@ -147,7 +147,7 @@ def test_real_planning_entry_rejects_discovered_but_inactive_nav2(runtime):
     helper,clients,manager,now,located=runtime
     helper.configure('walking');states(runtime,2,2)
     action=NS(server_is_ready=lambda:True,send_goal_async=lambda *_:pytest.fail('inactive goal sent'))
-    node=NS(_navigation_readiness=helper,navigation_client=action,robot_client=action)
+    node=NS(_navigation_readiness=helper,navigation_client=action,robot_client=action,_planning_inputs=())
     node.navigation_route_ready=lambda:QtNavRosNode.navigation_route_ready(node)
     assert not QtNavRosNode.navigation_component_ready(node,'nav2')
     assert not QtNavRosNode.send_navigation_waypoints(node,[[1.,2.]])

@@ -70,6 +70,45 @@ def test_verified_bundle_selects_both_navigation_assets(window, tmp_path, monkey
     assert window.relocalization_page.map._grid_shape == (12, 20)
 
 
+def test_global_retry_while_waiting_for_localization(window, monkeypatch):
+    window.pages.setCurrentWidget(window.relocalization_page)
+    window.local_grid = object()
+    window.node.map_navigation_state = lambda: (None, None, 0.)
+    window.node.navigation_route_ready = lambda: False
+    monkeypatch.setattr(window, "navigation_localization_backend", lambda: "pointcloud_localizer")
+    monkeypatch.setattr(window, "_relocalization_map_identity", lambda: ("map", "a" * 64))
+    controller = window.localization_tools_controller
+    ready = True
+    monkeypatch.setattr(controller, "initial_pose_readiness", lambda *_: (ready, ""))
+    monkeypatch.setattr(controller, "relocalization_timeout_readiness", lambda _: (True, ""))
+    for state, ready, expected in (
+        ("starting", True, True), ("starting", False, False),
+        ("running", True, True), ("stopped", True, False),
+    ):
+        window.navigation_stack_controller.overall_state = state
+        window._refresh_relocalization()
+        assert window.relocalization_page.automatic.isEnabled() == expected
+
+
+def test_cloud_localizer_map_arrow_requires_fresh_confirmed_pose():
+    from types import SimpleNamespace
+    import numpy as np
+    from nav_app.qt_nav_node import QtNavRosNode
+
+    ready = {"localizer": True, "dlio": True}
+    path = np.array([[1., 2., 0.]])
+    node = SimpleNamespace(
+        grid_frame="map", base_frame="base_link", require_localizer_quality=True,
+        path_in_frame=lambda _: path, lookup_matrix=lambda *_: np.eye(4),
+        navigation_component_ready=ready.__getitem__,
+    )
+    for localizer, odometry in ((False, True), (True, False), (True, True)):
+        ready.update(localizer=localizer, dlio=odometry)
+        route, xy, _ = QtNavRosNode.map_navigation_state(node)
+        np.testing.assert_array_equal(route, path[:, :2])
+        assert (xy is not None) == (localizer and odometry)
+
+
 def test_processing_map_blocks_recording_and_algorithms(window):
     operations = window.operations_page
     operations.library.worker.busy = True

@@ -14,6 +14,8 @@ def generate_launch_description():
     return launch.LaunchDescription(
         [
             DeclareLaunchArgument("use_sim_time", default_value="false"),
+            DeclareLaunchArgument("tracking_min_scan_points", default_value="0"),
+            DeclareLaunchArgument("tracking_confirm_translation_m", default_value="0.0"),
             DeclareLaunchArgument(
                 "sc_use_odom_gravity",
                 default_value="",
@@ -68,6 +70,10 @@ def generate_launch_description():
                         "use_sim_time": ParameterValue(
                             LaunchConfiguration("use_sim_time"), value_type=bool),
                         "config_path": LaunchConfiguration("config_path"),
+                        "tracking_min_scan_points": ParameterValue(
+                            LaunchConfiguration("tracking_min_scan_points"), value_type=int),
+                        "tracking_confirm_translation_m": ParameterValue(
+                            LaunchConfiguration("tracking_confirm_translation_m"), value_type=float),
                         "sc_use_odom_gravity_override": ParameterValue(
                             LaunchConfiguration("sc_use_odom_gravity"), value_type=str),
                         "default_map_path": ParameterValue(

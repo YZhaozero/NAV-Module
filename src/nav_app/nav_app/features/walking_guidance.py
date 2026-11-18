@@ -5,9 +5,10 @@ import numpy as np
 
 
 class WalkingGuidance:
-    def __init__(self, client, changed, clock=time.monotonic, ready=None):
+    def __init__(self, client, changed, clock=time.monotonic, ready=None, arrival_radius=.8):
         self.client, self.changed, self.clock = client, changed, clock
         self.ready = ready
+        self.arrival_radius = arrival_radius
         self.generation = 0
         self.phase = "idle"
         self.status = "选择目的地，规划步行路线"
@@ -129,7 +130,8 @@ class WalkingGuidance:
                            math.cos(math.atan2(vector[1], vector[0]) - yaw))
         self.direction = ("请转身" if abs(angle) > 2.2 else
                           "向左转" if angle > .6 else "向右转" if angle < -.6 else "沿路线前行")
-        near = self.remaining < .8 and np.linalg.norm(xy - self.path[-1, :2]) < .8
+        near = (self.remaining < self.arrival_radius
+                and np.linalg.norm(xy - self.path[-1, :2]) < self.arrival_radius)
         self._arrival_since = (self._arrival_since if self._arrival_since is not None else self.clock()) if near else None
         if self._arrival_since is not None and self.clock() - self._arrival_since >= 1.0:
             self.phase, self.direction, self.result = "arrived", "已到达目的地", 4

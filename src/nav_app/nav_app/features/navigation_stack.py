@@ -134,7 +134,7 @@ def validate_navigation_stack(config: NavigationStackConfig, *, cancelled=None, 
                          ("scan", ("external", "convert"))):
         if modes[key] not in choices:
             return False, f"未知接入选项：{key}"
-    if config.navigation_backend == "nav2" and not config.scan_topic.strip():
+    if config.navigation_backend in ("nav2", "walking") and not config.scan_topic.strip():
         return False, "Nav2 的 LaserScan 话题不能为空"
     if config.odometry_backend == "external" and not config.external_odom_topic.strip():
         return False, "已有里程计话题不能为空"
@@ -352,6 +352,11 @@ class NavigationStackController(QObject):
         self.overall_state = "stopped"
         self._generation = 0
         self._lidar_service_start = None
+        self._owns_native5_service = False
+        self._lidar_service_stop = QProcess(self)
+        self._lidar_service_stop.setProcessChannelMode(QProcess.MergedChannels)
+        self._lidar_service_stop.finished.connect(self._native5_stop_finished)
+        self._lidar_service_stop.errorOccurred.connect(self._native5_stop_error)
         self._launches: Dict[str, List[str]] = {}
         self._queue: List[str] = []
         self._waiting_key = ""
@@ -408,7 +413,7 @@ class NavigationStackController(QObject):
         if config.odometry_backend == "fast_livo" and config.fast_livo_vision:
             self._required_sensors.add("camera")
         self._external_inputs = {}
-        if config.navigation_backend == "nav2" and config.sensor_source == "live":
+        if config.navigation_backend in ("nav2", "walking") and config.sensor_source == "live":
             self._external_inputs["scan"] = "LaserScan " + config.scan_topic
             if config.odometry_backend == "external":
                 self._external_inputs["external_odom"] = "已有里程计 " + config.external_odom_topic + " 及 odom→base_link TF"
@@ -420,7 +425,7 @@ class NavigationStackController(QObject):
             set() if config.sensor_source == "bag" or config.odometry_backend == "external" else {"dlio"})
         if config.localization_backend == "pointcloud_localizer":
             self._readiness_components.add("localizer")
-        if config.sensor_source == "live" and config.navigation_backend in ("nav2",):
+        if config.sensor_source == "live" and config.navigation_backend in ("nav2", "walking"):
             self._readiness_components.add("nav2")
         self._launches = build_navigation_launches(config)
         self._queue = [key for key in START_ORDER if key in self._launches]
@@ -486,7 +491,7 @@ class NavigationStackController(QObject):
         if self.states["nav2"] != "waiting":
             self.states["nav2"] = "waiting"
             self.component_state_changed.emit("nav2", "waiting")
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= deadline and self.active_config.navigation_backend != "walking":
             self._record_log("system", message + "；输入超时，未启动 Nav2。\n")
             self._abort_for_failure("nav2")
             return
@@ -494,6 +499,11 @@ class NavigationStackController(QObject):
 
     def _launch_next_component(self):
         key = self._queue.pop(0)
+        if key == "lidar" and self._launches[key] == ["systemctl", "--user", "start", "nav-livox5.service"]:
+            self._owns_native5_service = True
+            self._waiting_key = key
+            self._start_native5_service()
+            return
         if self._component_running(key):
             self.states[key] = "running"
             self.component_state_changed.emit(key, "running")
@@ -591,6 +601,14 @@ class NavigationStackController(QObject):
             self.states[key] = "running"
             self.component_state_changed.emit(key, "running")
             self._later(self._startup_interval_ms, self._start_next)
+        elif time.monotonic() >= deadline and self.active_config.navigation_backend == "walking":
+            message = ("等待地图定位，请点击重新定位；已启动的组件继续运行"
+                       if key == "localizer" else f"等待{COMPONENT_LABELS[key]}有效数据；已启动的组件继续运行")
+            if message != self._waiting_input_message:
+                self._waiting_input_message = message
+                self._record_log("system", message + "\n")
+                self.input_waiting.emit(message)
+            self._later(500, lambda: self._poll_component_ready(key, deadline))
         elif time.monotonic() >= deadline:
             self._queue.clear()
             self._waiting_key = ""
@@ -712,6 +730,26 @@ class NavigationStackController(QObject):
             return
         if self._sensor_source == "bag":
             return
+        if self.active_config is not None and self.active_config.navigation_backend == "walking":
+            checks = [(key, self.sensor_active(key), COMPONENT_LABELS[key]) for key in self._required_sensors]
+            if self.component_ready is not None:
+                checks += [(key, self.component_ready(key), COMPONENT_LABELS[key])
+                           for key in self._readiness_components]
+                checks += [(key, self.component_ready(key), label) for key, label in self._external_inputs.items()]
+            missing = [label for key, ready, label in checks if not ready]
+            for key, ready, label in checks:
+                if key in self.states:
+                    state = "running" if ready else "waiting"
+                    if self.states[key] != state:
+                        self.states[key] = state
+                        self.component_state_changed.emit(key, state)
+            message = "等待数据：" + "、".join(missing) + "；路线规划已暂停" if missing else "路线规划已就绪；使用手柄控制行走"
+            if message != self._waiting_input_message:
+                self._waiting_input_message = message
+                self._record_log("system", message + "\n")
+                self.input_waiting.emit(message)
+            self._later(1000, self._monitor_sensor_health)
+            return
         for key in self._required_sensors:
             if not self.sensor_active(key):
                 self.states[key] = "error"
@@ -734,6 +772,8 @@ class NavigationStackController(QObject):
         self._later(1000, self._monitor_sensor_health)
 
     def stop(self, owned_only: bool = False) -> None:
+        if self._stopping:
+            return
         if self.configure_navigation is not None:self.configure_navigation(None)
         self._generation += 1
         if self._lidar_service_start is not None:
@@ -751,7 +791,7 @@ class NavigationStackController(QObject):
             if self._process_active(process):
                 targets.add(key)
         self._stop_targets = targets
-        if not targets:
+        if not targets and not self._owns_native5_service:
             self._stopping = False
             self._record_log("system", "没有仍在运行的受管组件需要停止。\n")
             self._set_overall_state("error" if self._failed_component else "stopped")
@@ -777,6 +817,12 @@ class NavigationStackController(QObject):
                 self._component_process(key) for key in self._stop_targets)
         ):
             return
+        if self._owns_native5_service:
+            if self._lidar_service_stop.state() == QProcess.NotRunning:
+                self._stop_targets.add("lidar")
+                self._record_log("system", "导航算法已退出，正在关闭 .5 雷达驱动。\n")
+                self._lidar_service_stop.start("systemctl", ["--user", "stop", "nav-livox5.service"])
+            return
         self._owned_components.clear()
         stopped_targets = set(self._stop_targets)
         self._stop_targets.clear()
@@ -786,6 +832,23 @@ class NavigationStackController(QObject):
             self.component_state_changed.emit(key, self.states[key])
         self._record_log("system", "导航系统进程已全部停止。\n")
         self._set_overall_state("error" if self._failed_component else "stopped")
+
+    def _native5_stop_error(self, error):
+        if error == QProcess.FailedToStart:
+            self._native5_stop_finished(-1, QProcess.CrashExit)
+
+    def _native5_stop_finished(self, code, status):
+        if code or status != QProcess.NormalExit:
+            detail = bytes(self._lidar_service_stop.readAllStandardOutput()).decode(errors="replace").strip()
+            self._record_log("system", f".5 雷达驱动停止失败：{detail or self._lidar_service_stop.errorString()}\n")
+            self._stopping = False
+            self.states["lidar"] = "error"
+            self.component_state_changed.emit("lidar", "error")
+            self._set_overall_state("error")
+            return
+        self._owns_native5_service = False
+        self._record_log("system", ".5 雷达驱动已停止。\n")
+        self._finish_stop_if_ready()
 
     def _component_process(self, key: str):
         if key in ("lidar", "camera"):
@@ -826,6 +889,7 @@ class NavigationStackController(QObject):
             self._record_log(key, text)
 
     def shutdown(self) -> None:
+        self._stopping = False
         if self.configure_navigation is not None:self.configure_navigation(None)
         self._generation += 1
         if self._lidar_service_start is not None:
@@ -835,3 +899,8 @@ class NavigationStackController(QObject):
         self._waiting_key = ""
         for process in self.processes.values():
             process.shutdown()
+        if self._owns_native5_service:
+            if self._lidar_service_stop.state() == QProcess.NotRunning:
+                self._lidar_service_stop.start("systemctl", ["--user", "stop", "nav-livox5.service"])
+            if not self._lidar_service_stop.waitForFinished(15000) and self._owns_native5_service:
+                self._record_log("system", ".5 雷达驱动未确认停止，请检查 nav-livox5.service。\n")

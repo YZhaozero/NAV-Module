@@ -22,6 +22,7 @@ def test_direction_uses_robot_heading(yaw, instruction):
 def test_upcoming_maneuver_uses_route_order(end, maneuver):
     cue = route_guidance([[0, 0], [5, 0], end], [0, 0], 0.)
     assert cue['instruction'] == '前方 5 米' + maneuver
+    assert cue['angle'] == pytest.approx(0.)  # The current segment still leads straight.
 
 
 def test_near_endpoint_is_not_nav2_success():

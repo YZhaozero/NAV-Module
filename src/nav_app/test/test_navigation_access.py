@@ -47,6 +47,7 @@ def test_saved_preset_controls_owned_launches_and_keeps_nav2(window, tmp_path, p
     assert validate_navigation_stack(config)[0]
     launches = build_navigation_launches(config)
     assert set(launches) == owned
+    assert ("tracking_confirm_translation_m:=0.10" in launches.get("localizer", [])) == (preset == "woosh_native5")
     assert config.navigation_backend == "nav2"
     assert not any("enable_base_control:=true" in args for args in launches.values())
     if preset == "woosh_native5":
@@ -324,7 +325,7 @@ def test_native5_service_precedes_algorithms_and_failures_stop_startup(tmp_path,
     executable.write_text(
         "#!/usr/bin/python3\nimport sys, time\nfrom pathlib import Path\n"
         f"Path({str(record)!r}).write_text(' '.join(sys.argv[1:]))\n"
-        + ("time.sleep(10)\n" if outcome in ("stop", "timeout") else "")
+        + ("if 'start' in sys.argv: time.sleep(10)\n" if outcome in ("stop", "timeout") else "")
         + ("sys.exit(7)\n" if outcome == "service_error" else ""))
     executable.chmod(0o755)
     if outcome == "missing_systemctl":executable.unlink()
@@ -349,7 +350,7 @@ def test_native5_service_precedes_algorithms_and_failures_stop_startup(tmp_path,
         assert controller.start(config)[0]
         if outcome == "already_online":
             wait_for(application, lambda:controller.overall_state == "running")
-            assert not record.exists()
+            assert record.read_text() == "--user start nav-livox5.service"
         elif outcome in ("service_error", "missing_systemctl"):
             wait_for(application, lambda:controller.overall_state == "error")
             assert not any(p.calls for p in controller.processes.values())
@@ -364,7 +365,7 @@ def test_native5_service_precedes_algorithms_and_failures_stop_startup(tmp_path,
                 service_deadline[0]()
             wait_for(application, lambda:bool(finished))
             application.processEvents()
-            assert controller.overall_state == ("stopped" if outcome == "stop" else "error")
+            wait_for(application, lambda: controller.overall_state == ("stopped" if outcome == "stop" else "error"))
             assert not any(p.calls for p in controller.processes.values())
         else:
             wait_for(application, lambda:controller.states["lidar"] == "waiting")
@@ -373,13 +374,16 @@ def test_native5_service_precedes_algorithms_and_failures_stop_startup(tmp_path,
             if outcome == "data_timeout":
                 controller._sensor_wait_deadline = 0
                 controller._poll_sensor_data("lidar")
-                assert controller.overall_state == "error"
+                wait_for(application, lambda: controller.overall_state == "error")
                 assert not any(p.calls for p in controller.processes.values())
             else:
                 live["lidar"] = True
                 wait_for(application, lambda:controller.overall_state == "running")
                 assert all(p.calls for p in controller.processes.values())
         controller.stop()
+        if outcome in ("already_online", "data"):
+            wait_for(application, lambda: controller.overall_state == "stopped")
+            assert record.read_text() == "--user stop nav-livox5.service"
         assert not any(p.stops for p in controller.sensor_controller.processes.values())
     finally:
         controller.shutdown()

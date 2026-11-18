@@ -123,3 +123,21 @@ def test_turn_directions_are_relative_to_device_heading():
     assert session.direction == "向左转"
     session.update_pose([0., 0.], np.pi)
     assert session.direction == "向右转"
+
+
+def test_short_woosh_route_cannot_finish_at_start():
+    now = [0.]
+    client = Client()
+    session = WalkingGuidance(client, lambda _: None, clock=lambda: now[0], arrival_radius=.25)
+    session.plan(object())
+    goal = Goal()
+    client.requests[0].complete(goal)
+    goal.result.complete(path_reply([(0., 0.), (.6, 0.)]))
+    session.begin()
+    for t, x in ((0., 0.), (2., 0.), (3., .55)):
+        now[0] = t
+        session.update_pose([x, 0.], 0.)
+        assert session.phase == "guiding"
+    now[0] = 4.1
+    session.update_pose([.55, 0.], 0.)
+    assert session.phase == "arrived"

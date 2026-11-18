@@ -395,7 +395,7 @@ def test_navigation_setup_cloud_is_draggable_and_clickable():
     assert len(selected) == 1
 
 
-def test_successful_navigation_shows_transition_before_returning():
+def test_successful_navigation_keeps_notice_until_returning():
     app = QApplication.instance() or QApplication([])
     assert app is not None
 
@@ -426,18 +426,20 @@ def test_successful_navigation_shows_transition_before_returning():
     window._handle_navigation_terminal_state()
 
     assert window.pages.currentWidget() is window.active_page
-    assert window.navigation_return_timer.isActive()
     assert window.pending_navigation_result_status == 4
     assert not window.active_page.result_overlay.isHidden()
     assert "已到达目的地" in window.active_page.result_overlay.text()
-    assert window.active_page.exit_button.text() == "立即返回地图"
+    assert window.active_page.exit_button.text() == "返回地图"
     assert len(window.waypoints) == 1
 
     window.exit_navigation()
     assert window.pages.currentWidget() is window.setup_page
     assert window.waypoints == []
     assert not node.cancelled
-    assert node.navigation_status == "导航成功，已自动返回地图"
+    assert node.navigation_status == "导航成功，已返回地图"
+    window.close()
+    app.processEvents()
+    window.operations_page.task_coordinator.thread.join(timeout=5)
 
 
 def test_sensor_manager_has_independent_page_and_launch_arguments():
@@ -1146,6 +1148,7 @@ def test_global_path_is_ignored_after_navigation_exit():
 def test_nav2_plan_topic_is_preferred_over_legacy_global_plan():
     class FakeNode:
         navigation_active = True
+        operating_mode = "robot"
         path_topic = "/plan"
         path_topics = ("/plan", "/global_plan")
         active_path_topic = ""

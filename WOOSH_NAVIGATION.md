@@ -1,6 +1,26 @@
 # WOOSH：NAV-Module 自主定位与规划
 
-本配置默认使用 FAST-LIVO2，继续使用 bridge 的 `.3` 点云、配对 IMU 的原生 SI 适配和相机1实际标定。NAV-Module 负责新地图定位和 Nav2 规划；WOOSH 仅作为未来的底盘执行端。默认 **不启动 WOOSH 执行适配器**，当前可以验证定位和路线，不能用“开始导航”带动机器人。
+当前 WOOSH 导航使用本机 `.5` 雷达和配对 IMU，经 FAST-LIVO2 提供里程计、点云 Localizer 提供地图定位，再由 Nav2 计算路线。相机1继续显示桥接画面；按用户要求，导航预设已恢复开启视觉融合，保留开关，建图配置不变。底盘执行不接入，操作者使用手柄行走。
+
+## 2026-11-18：GS 步行规划启动流程
+
+进入导航后的启动顺序：确认/启动独立 `.5` 雷达服务 → FAST-LIVO2（雷达＋IMU＋相机）及机身滤波 → 自有 `/scan` → 点云 Localizer → `nav_app/walking_planner.launch.py`。实机 .5 预设选择「由 NAV 启动」时，结束导航会在算法退出后关闭 nav-livox5.service，下次进入导航重新采集。相机继续预览。
+
+只规划后端沿用 GS 的拆分：仅启动 `map_server`、`planner_server`、`lifecycle_manager_walking`。不启动 controller、BT navigator、behavior、waypoint follower、velocity smoother、motion guard 或底盘适配器。保留 WOOSH 的机身轮廓和实时 scan，地图与规划器必须实际 Active，定位、里程计、scan 有效后才允许提交 ComputePathThroughPoses。
+
+定位尚未完成或输入暂时中断时显示等待，暂停新的路线规划，保留进程与地图；输入恢复后重新就绪，不自动重发路线请求。算法进程意外退出仍报错，显式停止仍按反向顺序退出受管组件。AMCL 未启用。
+
+使用：打开桌面 NAV → 选择地图包 → 进入导航 → 等待就绪（必要时点击“重新定位”）→ 在栅格地图选点 → 点击“规划路线” → 按显示路线用手柄行走。导航接入设置中的 `.5 雷达＋IMU + 相机融合` 为当前预设；“FAST-LIVO 视觉”默认开启，开关保留。恢复后的完整导航验收尚未通过，当前仍需排查 IMU 接收异常。
+
+本地回归 82 项通过。第一轮视觉融合开启时未通过完整定位验收；同场地、用户确认车未移动时，关闭视觉融合后完成实际地图定位与路线规划（44 个点，约 1.11 m），无运动 action 调用，`/cmd_vel` 和 `/foo/nav_cmd_vel` 无发布者。该对照仅为关闭视觉时的历史验证，不能直接证明相机标定或同步问题的唯一根因，也不代表运动执行或定位精度验收。
+
+第二次冷启动成功，运行 75 秒后再次规划得到 43 个点、约 1.11 m 的路线；期间曾有短暂定位失效，系统暂停规划并恢复，未停止整套进程。两次设备上打开导航系统页耗时约 163 ms、195 ms。这是使用真实传感器的离屏 Qt 验证，不等同于物理触摸、行驶精度或长期稳定性验收。
+
+设备现有 `~/.config/NAV/NavigationAccess.conf` 已仅将 `profiles/woosh` 的 `fast_livo_vision` 恢复保存为 true，其他输入设置保持不变；已运行的 APP 需要重新打开以加载该设置。原设置保存为备份目录下 `NavigationAccess.conf.before`；原接入页源码为 `navigation_access.py.before`。完整结果分别为 `lio-planning-acceptance.json` 和 `lio-repeat-planning-acceptance.json`，失败的视觉融合首轮也保留在 `startup-acceptance.json`。
+
+设备备份：`~/nav-deploy-backups/20261118-gs-walking-startup/`；源码主体在 `before.tar.gz`，后续接入设置源码与用户设置单独备份。回滚主体：停止 APP 后，在 `~/nav-current` 解包 `before.tar.gz`，恢复接入设置备份，再 `source scripts/runtime_environment.sh`、`colcon build --packages-select nav_app`，重新启动 APP。新增 walking launch/config 在旧代码下不再被调用。
+
+以下日期段保留历史记录；关于完整 Nav2 启动及旧默认传感器的说明由本节替代。
 
 ## 2026-11-17：手柄行走、只规划路线与页面显示
 
@@ -175,7 +195,8 @@ ros2 launch nav_app woosh_navigation.launch.py \
 
 ## 2026-11-17：.5 点云过滤与扫描通信修复
 
-- `.5` 预设的 `nav_cloud_self_filter` 进程和 `woosh_livox5_scan.launch.py` 内的扫描转换进程使用 `nav_cloud_self_filter/config/fastdds_udp.xml`，仅启用 UDPv4。
+- 11 月 17 日版本曾为车身过滤器和扫描转换器强制启用 UDPv4。11 月 18 日实机逐帧核对发现，在同一窗口驱动发出 282 帧、过滤器发出 224 帧、FAST-LIVO 收到 192 帧。当前车身过滤器沿用驱动和 FAST-LIVO 的本机默认 DDS 传输；扫描转换器仍使用专用 UDPv4 配置。
+- 11 月 18 日从桌面重启 .5 导航后，以同一首尾点云时间戳对齐 DDS 发布序号和 FAST-LIVO 接收回调计数。141.064 秒内三处均为 1,419 帧；132 个滑动 10 秒窗口为 9.998–10.101 Hz。设备验收记录保存在 `~/nav-deploy-backups/20261118-livox5-10hz.pP34rp/verification/results.txt`。
 - APP 根据 `.5` 预设自动选择这个扫描入口，无需手动导出环境变量。输入仍为 `/nav/livox5/points_filtered`，输出仍为 `/scan`；高度、量程、坐标系和时间戳处理不变。
 - 配置只作用于上述处理进程；雷达驱动、ROS1 bridge、FAST-LIVO 和其他机器人预设的通信环境不变。没有新增底盘运动控制。
 - 通信修复与地图定位是两项独立验收。完整导航测试仍遇到定位匹配拒绝、点云与里程计时间不同步，不能据此宣称整套导航或路线规划已通过。

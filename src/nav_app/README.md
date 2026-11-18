@@ -71,13 +71,11 @@ ros2 launch nav_app ar_nav.launch.py pointcloud_map_path:=""
 该命令会立即打开 Qt 导航控制台；相机尚未发布图像时显示等待页面，收到第一帧后自动
 切换到实时画面。设置页的小相机只显示预览，不显示距离状态卡。主地图每次点击会依次
 追加一个途径点；右侧列表可单独选择某个途径点并重新选点或删除，删除后会自动重新
-编号。机器人从当前 TF 位置出发，
-按编号顺序前往各点。点击“开始导航”后进入纯导航页面，仅保留相机、AR 路线、左下角
-小地图和右上角“退出导航”按钮，同时在全屏相机左上角显示方向与剩余距离状态卡。到达最后一个目标
-点后先显示“已到达目的地”的完成提示，短暂停留后自动返回地图页，也可以点击“立即
-返回地图”跳过等待；手动退出会取消
-整个 `/navigate_through_poses` 任务。如果通过 SSH 启动，需要保证图形转发可用并且环境
-中存在 `DISPLAY`。
+编号。规划路线后进入导航预览页，路线就绪后点击“开始导航”，显示相机、AR 路线、左下角
+小地图及方向和剩余距离。手柄模式由用户控制小车行走，界面使用实时定位判断到达；机器人自动模式仍需明确点击“开始导航”确认任务。
+到达最后一个目标点后显示“已到达目的地”，提示保持显示，点击“返回地图”结束本次导航。
+成功、取消或失败时会清理路线和本次定位轨迹，当前位置标记继续更新；手动退出会取消当前任务。
+如果通过 SSH 启动，需要保证图形转发可用并且环境中存在 `DISPLAY`。
 
 ## WOOSH 底盘遥控（Agent 0.0.7）
 
@@ -148,6 +146,32 @@ sudo modprobe xpad
 随后用 `ros2 run joy joy_enumerate_devices` 验证识别，再进入页面做实物标定。这些命令只安装输入驱动，
 不发送底盘速度。驱动只适用于当前内核版本；升级内核后应使用新内核头文件重新编译。
 源码：[Linux stable xpad.c](https://github.com/gregkh/linux/blob/v5.15.148/drivers/input/joystick/xpad.c)。
+
+### P3 手柄可识别但按钮和摇杆不变化（2026-11-18）
+
+这只 P3 布局手柄在 USB 上报 `045e:028e / Nintendo Co., Ltd. / XBOX 360 For Windows`。
+xpad 能创建输入设备，但该兼容固件需要额外初始化；ROS 重复发布初始状态不能证明真实按键已经工作。
+已实测 USB 初始化后，内核和 ROS 都能收到叉号键按下/松开及左摇杆变化。
+
+一次性初始化（需要管理员 USB 写权限，不会访问底盘控制接口）：
+
+```bash
+sudo python3 ~/nav-current/deployment/p3_gamepad.py
+```
+
+为避免重新插拔或开机后再次执行，安装仅匹配该 VID/PID、厂家和产品字符串的 udev 规则：
+
+```bash
+sudo python3 ~/nav-current/deployment/p3_gamepad.py --install
+```
+
+安装程序把脚本复制到 root 管理的 `/usr/local/lib/nav/p3_gamepad.py`，规则为
+`/etc/udev/rules.d/99-nav-p3-gamepad.rules`。安装时不重新初始化或重启当前手柄，下一次 USB 插入时生效。
+不会覆盖内容不同的同名文件。需要撤销时删除这两个文件并执行 `sudo udevadm control --reload-rules`。
+兼容请求参考：[xpad 的兼容初始化处理](https://github.com/paroj/xpad/blob/master/xpad.c)。
+
+标定页已改为逐条处理输入，修复短按在界面刷新之间被松开覆盖的问题，并增加“最近按下”显示。
+短按修复需重新打开 NAV 后加载；正在进行的标定可以先保存，无需为安装 udev 规则中断当前操作。
 
 ## 传感器管理
 
@@ -425,3 +449,11 @@ PYTHONNOUSERSITE=1 QT_QPA_PLATFORM=offscreen ROS_DOMAIN_ID=187 ROS_LOCALHOST_ONL
 
 设备备份及全部实测日志：`/home/nvidia/nav-deploy-backups/20261116-fast-livo-imu-tf/`。原车 `bridge.yaml.bak.20261116-fast-livo-imu-tf` 和 `autostart.sh.bak.20261116-fast-livo-imu-tf` 保留。回退需要定向恢复对应源码并重新编译 `fast_livo`、`localizer`、`nav_app`；FAST-LIVO 的实现包含动态库，单独替换主可执行文件不是完整回退。
 
+
+## 导航结束后的路线清理（2026-11-18）
+
+导航成功、取消、失败、手动退出或停止导航服务后，会统一清除地图页和导航页的规划路线、当前任务定位轨迹及相机 AR 叠加缓存。当前位置标记继续更新，地图文件、日志和录包保留。结束后的迟到路线数据不会重新画回；下一次被接受的任务从新的轨迹开始。
+
+更新后需重新打开 NAV 一次，运行中的任务请先结束。部署前源码备份与验证记录位于 `/home/nvidia/nav-deploy-backups/20261118-navigation-overlays/`。
+
+验证覆盖任务成功/取消/失败、返回前后刷新、停止服务、晚到数据及新任务。另两项旧 UI 用例（unknown_policy_combo 与原导航日志入口）已在修改前版本确认失败，本轮保留其他页面行为。

@@ -39,6 +39,7 @@
 // 本地头文件
 #include "localizers/commons.h"
 #include "tracking_policy.h"
+#include <optional>
 #include "initialization_window.h"
 #include "localizers/icp_localizer.h"
 #include "localizers/pose_graph_manager.h" // 引入PoseGraph
@@ -109,6 +110,8 @@ public:
         match_timeout_ = declare_parameter<double>("tracking_timeout_s", 5.0, tracking_startup);
         max_correction_ = declare_parameter<double>("tracking_max_correction_m", 0.5, tracking_startup);
         max_rotation_ = declare_parameter<double>("tracking_max_correction_deg", 15.0, tracking_startup);
+        tracking_min_scan_points_ = declare_parameter<int>("tracking_min_scan_points", 0, tracking_startup);
+        confirm_translation_ = declare_parameter<double>("tracking_confirm_translation_m", 0., tracking_startup);
         rcl_interfaces::msg::ParameterDescriptor relocalization_runtime;
         relocalization_runtime.description =
             "Maximum age/compute window for one manual or global relocalization; runtime configurable for field tests.";
@@ -117,7 +120,8 @@ public:
             relocalization_runtime);
         if (!std::isfinite(match_timeout_) || !std::isfinite(max_correction_) || !std::isfinite(max_rotation_) ||
             !std::isfinite(m_config.update_hz) || m_config.update_hz <= 0 ||
-            match_timeout_ <= 0 || max_correction_ <= 0 || max_rotation_ <= 0 ||
+            !std::isfinite(confirm_translation_) || confirm_translation_ < 0. ||
+            tracking_min_scan_points_ < 0 || match_timeout_ <= 0 || max_correction_ <= 0 || max_rotation_ <= 0 ||
             !std::isfinite(relocalization_timeout_s_) ||
             relocalization_timeout_s_ < 30. || relocalization_timeout_s_ > 600.)
             throw std::invalid_argument("tracking thresholds must be positive");
@@ -802,6 +806,27 @@ public:
             !m_state.message_received ? "input_unavailable" :
             !acceptable ? "correction_rejected" :
             !age_valid ? "observation_expired" : "accepted";
+        const M3D map_body_r = work.guess.block<3,3>(0,0).cast<double>();
+        const V3D map_body_t = work.guess.block<3,1>(0,3).cast<double>();
+        const M3D map_odom_r = map_body_r * work.odom_rotation.transpose();
+        const V3D map_odom_t = map_body_t - map_odom_r * work.odom_translation;
+        const double correction_m = (map_body_t - work.prior.block<3,1>(0,3).cast<double>()).norm();
+        bool hold = false;
+        if (result && !initialization && confirm_translation_ > 0. && correction_m >= confirm_translation_) {
+            // Compare both matches at the NEW scan's body pose, allowing actual vehicle motion.
+            const auto &p = pending_tracking_;
+            const bool agrees = p && p->generation == work.generation && work.stamp > p->stamp &&
+                (now().nanoseconds() - p->stamp) / 1e9 <= allowed_age &&
+                (p->map_odom_r * work.odom_translation + p->map_odom_t - map_body_t).norm() <= confirm_translation_ * .5 &&
+                Eigen::AngleAxisd(p->map_odom_r.transpose() * map_odom_r).angle() <= 3. * M_PI / 180.;
+            hold = !agrees;
+            last_match_reason_ = hold ? "tracking_correction_pending" : "tracking_correction_confirmed";
+            if (hold)
+                pending_tracking_ = TrackingCorrection{map_odom_r, map_odom_t, work.stamp, work.generation};
+            RCLCPP_INFO(get_logger(), "Tracking correction %.3f m at stamp %ld: %s",
+                correction_m, static_cast<long>(work.stamp), last_match_reason_.c_str());
+        }
+        if (!hold) pending_tracking_.reset();
         if (provisional)
             last_match_reason_ = "awaiting_fresh_confirmation";
         RCLCPP_INFO(
@@ -811,13 +836,17 @@ public:
             work.elapsed_s, observation_age, last_match_reason_.c_str(),
             work.global, work.confirming);
         updateDiagnostics(work.generation, work.operation, work.diagnostics);
+        if (hold) {
+            finishDiagnostics("WAITING_TRACKING_CONFIRMATION");
+            last_quality_ = 0.;
+            publishQuality();
+            return; // Preserve the last accepted TF, its timestamp and quality expiry.
+        }
         if (result) {
             if (provisional && !candidate_pending_)
                 candidate_deadline_ = monotonicSeconds() + std::max(0., allowed_age-observation_age);
-            const M3D map_body_r = work.guess.block<3,3>(0,0).cast<double>();
-            const V3D map_body_t = work.guess.block<3,1>(0,3).cast<double>();
-            m_state.last_offset_r = map_body_r * work.odom_rotation.transpose();
-            m_state.last_offset_t = map_body_t - m_state.last_offset_r * work.odom_translation;
+            m_state.last_offset_r = map_odom_r;
+            m_state.last_offset_t = map_odom_t;
             m_state.localize_success = !provisional;
             candidate_pending_ = provisional;
             m_state.icp_failure_count = 0;
@@ -885,8 +914,9 @@ public:
         if (match_future_.valid() || !m_state.message_received || !m_state.map_loaded) return;
         const double t = monotonicSeconds();
         const int64_t stamp = rclcpp::Time(m_state.last_message_time).nanoseconds();
+        const bool confirming_jump = pending_tracking_ && pending_tracking_->generation == match_generation_.load();
         if (dataAge() < -.1 || dataAge() > 1. || stamp == last_attempt_stamp_ ||
-            t-last_attempt_ < 1./std::max(.2, std::min(2., m_config.update_hz))) return;
+            (!confirming_jump && t-last_attempt_ < 1./std::max(.2, std::min(2., m_config.update_hz)))) return;
         const bool manual = m_state.service_received && m_state.skip_global_registration;
         const bool global = m_state.force_sc_relocalization ||
             (!m_state.localize_success && !manual && !initial_attempted_);
@@ -896,6 +926,14 @@ public:
             RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
                 "Waiting for multi-frame initialization: %zu frames, %.3f s",
                 initialization_window_.size(), initialization_window_.spanNs()/1e9);
+            return;
+        }
+        if (!global && !manual &&
+            m_state.last_cloud->size() < static_cast<std::size_t>(tracking_min_scan_points_)) {
+            last_attempt_stamp_ = stamp;
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                "Skipping sparse tracking scan: %zu points (minimum %d)",
+                m_state.last_cloud->size(), tracking_min_scan_points_);
             return;
         }
         last_attempt_ = t; last_attempt_stamp_ = stamp;
@@ -1546,6 +1584,15 @@ private:
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr quality_pub_;
     std::string map_sha256_, instance_id_, body_frame_, input_error_;
     int64_t last_odom_stamp_ = 0;
+    int tracking_min_scan_points_ = 0;
+    double confirm_translation_ = 0.;
+    struct TrackingCorrection {
+        M3D map_odom_r;
+        V3D map_odom_t;
+        int64_t stamp;
+        uint64_t generation;
+    };
+    std::optional<TrackingCorrection> pending_tracking_;
     double match_timeout_ = 5., max_correction_ = .5, max_rotation_ = 15.;
     double relocalization_timeout_s_ = 120.;
     double last_attempt_ = 0, last_success_ = 0, last_quality_ = 0, last_fitness_ = -1.;

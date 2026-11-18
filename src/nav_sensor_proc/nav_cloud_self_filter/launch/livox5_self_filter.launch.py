@@ -17,7 +17,6 @@ def generate_launch_description():
         DeclareLaunchArgument("enabled", default_value="true"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         Node(package="nav_cloud_self_filter", executable="cloud_self_filter", name="nav_livox5_self_filter",
-             additional_env={"FASTRTPS_DEFAULT_PROFILES_FILE": os.path.join(share, "config", "fastdds_udp.xml")},
              output="screen", parameters=[LaunchConfiguration("filter_params_file"), {
                  "enabled": ParameterValue(LaunchConfiguration("enabled"), value_type=bool),
                  "use_sim_time": ParameterValue(LaunchConfiguration("use_sim_time"), value_type=bool)}],

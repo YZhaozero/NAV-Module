@@ -106,6 +106,10 @@ class PointCloudLocalizerBackend(LaunchBackend):
                 "rough_max_iteration", "refine_max_iteration",
             ):
                 arguments.append(f"{name}_override:={getattr(config, name)}")
+        if (config.robot_profile == "woosh" and config.odometry_backend == "fast_livo"
+                and config.woosh_fast_livo_profile == "native5"):
+            arguments.append("tracking_min_scan_points:=2000")
+            arguments.append("tracking_confirm_translation_m:=0.10")
         if config.odometry_backend == 'fast_livo' and config.map_gravity_aligned:
             arguments.append('sc_use_odom_gravity:=true')
         if config.scan_context_map.strip():
@@ -211,6 +215,26 @@ class Nav2Backend(LaunchBackend):
         return arguments
 
 
+class WalkingPlannerBackend(Nav2Backend):
+    key = "walking"
+    label = "Nav2 · 仅规划路线"
+    description = "使用地图和实时 scan 规划路线；手柄控制行走，不启动运动控制组件。"
+
+    def validate(self, config):
+        if config.localization_backend in ("amcl", "disabled"):
+            return False, "仅规划模式需要点云定位或已有地图定位 TF"
+        return super().validate(config)
+
+    def launch_arguments(self, config):
+        arguments = ["launch", "nav_app", "walking_planner.launch.py",
+                     f"map:={Path(config.navigation_map).expanduser().resolve()}",
+                     f"scan_topic:={config.scan_topic.strip()}",
+                     f"robot_profile:={config.robot_profile}",
+                     f"use_sim_time:={launch_bool(config.use_sim_time)}",
+                     f"autostart:={launch_bool(config.autostart)}"]
+        if config.nav2_params.strip():
+            arguments.append(f"params_file:={Path(config.nav2_params).expanduser().resolve()}")
+        return arguments
 
 
 class ScanPlannerBackend(LaunchBackend):
@@ -316,6 +340,7 @@ LOCALIZATION_BACKENDS: Dict[str, LaunchBackend] = {
 NAVIGATION_BACKENDS: Dict[str, LaunchBackend] = {
     backend.key: backend for backend in (
         Nav2Backend(),
+        WalkingPlannerBackend(),
         ScanPlannerBackend(),
         CustomNavigationBackend(),
     )

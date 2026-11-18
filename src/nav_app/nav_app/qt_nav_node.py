@@ -535,6 +535,7 @@ class MapPanel(QWidget):
         self._robot_xy: Optional[np.ndarray] = None
         self._robot_yaw = 0.0
         self._navigation_follow = False
+        self._last_follow_transform = QTransform()
         self._waypoints = []
         self._selected_waypoint_index: Optional[int] = None
         self._edit_tool = "navigate"
@@ -1172,6 +1173,8 @@ class MapPanel(QWidget):
     def set_navigation_follow(self, enabled: bool) -> None:
         self._navigation_follow = (
             bool(enabled) and self._edit_tool == "navigate")
+        if not self._navigation_follow:
+            self._last_follow_transform = QTransform()
         self._sync_navigation_view()
         self.navigation_follow_changed.emit(self._navigation_follow)
         self.update()
@@ -1192,8 +1195,10 @@ class MapPanel(QWidget):
 
     def _map_follow_transform(self) -> QTransform:
         transform = QTransform()
-        if not self._navigation_follow or self._robot_xy is None:
+        if not self._navigation_follow:
             return transform
+        if self._robot_xy is None:
+            return self._last_follow_transform
         _pixmap, _shape, _origin, resolution, origin_yaw = self._view()
         if resolution <= 0.0:
             return transform
@@ -1201,6 +1206,7 @@ class MapPanel(QWidget):
         transform.translate(self.width() * .5, self.height() * .60)
         transform.rotate(math.degrees(self._robot_yaw - origin_yaw) - 90.0)
         transform.translate(-center.x(), -center.y())
+        self._last_follow_transform = transform
         return transform
 
     def set_waypoints(self, waypoints) -> None:
@@ -1886,7 +1892,7 @@ class MapPanel(QWidget):
             return
         center = self.world_to_widget(self._robot_xy)
         _pixmap, _shape, _origin, _resolution, origin_yaw = self._view()
-        heading = -(self._robot_yaw - origin_yaw)
+        heading = -math.pi / 2 if self._navigation_follow else origin_yaw - self._robot_yaw
         base = np.array([[12, 0], [-8, -7], [-5, 0], [-8, 7]], dtype=float)
         rotation = np.array([
             [math.cos(heading), -math.sin(heading)],
@@ -2035,6 +2041,7 @@ class QtNavRosNode(Node):
             else "/livox/lidar/pointcloud")
         self._navigation_input_subscriptions = []
         self._last_scan_message_time = 0.
+        self._planning_inputs = ()
         self._amcl_initial_pose_time = 0.
         self.amcl_initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 1)
         self._navigation_lidar_subscription = self.tf_listener.node.create_subscription(
@@ -2099,7 +2106,8 @@ class QtNavRosNode(Node):
         from .features.robot_navigation import RobotNavigation
         self.walking = WalkingGuidance(
             self.navigation_client, self._walking_changed,
-            ready=self.navigation_route_ready)
+            ready=self.navigation_route_ready,
+            arrival_radius=.25 if self.robot_profile == "woosh" else .8)
         self.robot = RobotNavigation(
             self.robot_client, self._robot_changed,
             ready=self.navigation_route_ready)
@@ -2183,6 +2191,7 @@ class QtNavRosNode(Node):
             owner.destroy_subscription(subscription)
         self._navigation_input_subscriptions.clear()
         self._last_scan_message_time = 0.
+        self._planning_inputs = ()
         self._fast_navigation_odometry = False
         if config is None:  # The stack has stopped or is shutting down.
             self.require_localizer_quality = False
@@ -2215,6 +2224,12 @@ class QtNavRosNode(Node):
                 QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                            history=HistoryPolicy.KEEP_LAST, depth=2))
         self.require_localizer_quality = config.localization_backend == "pointcloud_localizer"
+        if config.navigation_backend == "walking" and not config.use_sim_time:
+            self._planning_inputs = (
+                ("scan", "等待实时 scan；路线规划已暂停"),
+                ("external_odom" if config.odometry_backend == "external" else "dlio", "等待有效里程计；路线规划已暂停"),
+                ("localizer" if self.require_localizer_quality else "external_localization", "等待地图定位，请使用重新定位"),
+            )
         self._navigation_readiness.configure(
             config.navigation_backend, mode=self.operating_mode)
         self._odometry_received = {"dlio": 0., "fast_livo": 0., "external": 0.}
@@ -2314,9 +2329,14 @@ class QtNavRosNode(Node):
         return True
 
     def navigation_route_ready(self) -> bool:
-        return self._navigation_readiness.ready(
+        ready = self._navigation_readiness.ready(
             self.navigation_client.server_is_ready(),
             self.robot_client.server_is_ready())
+        for key, reason in self._planning_inputs:
+            if not self.navigation_component_ready(key):
+                self._navigation_readiness.reason = reason
+                return False
+        return ready
 
     @property
     def navigation_readiness_reason(self) -> str:
@@ -2333,7 +2353,7 @@ class QtNavRosNode(Node):
             else:
                 self.navigation_status = self.navigation_readiness_reason
                 self._route_wait_status = self.navigation_status
-        if (self.navigation_active and self.require_localizer_quality and
+        if (self.navigation_active and self.operating_mode == "robot" and self.require_localizer_quality and
                 not self.localization_tools.health.valid(self.get_clock().now().nanoseconds)):
             self.cancel_navigation()
             self.navigation_status = "地图定位失效，已请求取消导航；请重新定位"
@@ -2410,6 +2430,9 @@ class QtNavRosNode(Node):
         if not self.navigation_active:
             if self.walking.phase != "preview":
                 self.clear_navigation_path()
+            return
+        if self.operating_mode == "walking" and self.walking.phase in ("guiding", "lost", "deviated"):
+            # The accepted planning action owns the hand-guided route.
             return
         source_topic = str(source_topic or getattr(
             self, "path_topic", "/plan"))
@@ -2505,6 +2528,11 @@ class QtNavRosNode(Node):
     def map_navigation_state(self):
         path = self.path_in_frame(self.grid_frame)
         path_xy = None if path is None or not len(path) else path[:, :2]
+        if self.require_localizer_quality and not (
+            self.navigation_component_ready("localizer")
+            and self.navigation_component_ready("dlio")
+        ):
+            return path_xy, None, 0.0
         matrix = self.lookup_matrix(self.grid_frame, self.base_frame)
         if matrix is None:
             return path_xy, None, 0.0
@@ -2583,9 +2611,10 @@ class QtNavRosNode(Node):
             return
         self.navigation_status = session.status
         if self.robot_profile == "woosh" and self.operating_mode == "walking" and session.phase == "preview":
-            self.navigation_status = f"路线已生成，约 {session.remaining:.1f} 米；请用手柄控制小车行走"
+            self.navigation_status = f"路线已生成，约 {session.remaining:.1f} 米；请在导航页点击“开始导航”，使用手柄控制小车行走"
         self.navigation_active = session.phase in (
             "guiding", "lost", "deviated")
+        self._guidance_progress = session.progress
         self.path = session.path
         self.path_frame = session.frame
         self.goal_handle = session.handle
@@ -2779,6 +2808,7 @@ class ActiveNavigationPage(QWidget):
         self.follow_button.setCheckable(True)
         self.follow_button.toggled.connect(
             self.map_panel.set_navigation_follow)
+        self.map_panel.navigation_follow_changed.connect(self.follow_button.setChecked)
         self.follow_button.setParent(self)
         self.mode_group = QButtonGroup(self)
         self.mode_group.setExclusive(True)
@@ -2788,7 +2818,7 @@ class ActiveNavigationPage(QWidget):
         self.exit_button.setObjectName("exitNavigationButton")
         self.exit_button.clicked.connect(exit_callback)
         self.exit_button.setParent(self)
-        self.begin_button = QPushButton("确认路线并开始")
+        self.begin_button = QPushButton("开始导航")
         self.begin_button.setObjectName("primaryButton")
         self.begin_button.clicked.connect(begin_callback)
         self.begin_button.setParent(self)
@@ -2802,12 +2832,12 @@ class ActiveNavigationPage(QWidget):
     def show_navigation_result(self, status: Optional[int], text: str) -> None:
         if status == 4:
             title = "✓ 已到达目的地"
-            detail = "导航任务完成，即将返回地图"
+            detail = "导航任务完成，点击“返回地图”结束本次导航"
             border = "#43d17d"
             background = "rgba(10, 42, 27, 235)"
         elif status == 5:
             title = "导航已取消"
-            detail = "即将返回地图"
+            detail = "点击“返回地图”结束本次导航"
             border = "#ffc857"
             background = "rgba(49, 39, 13, 235)"
         else:
@@ -2824,7 +2854,7 @@ class ActiveNavigationPage(QWidget):
             "}")
         self.result_overlay.show()
         self.result_overlay.raise_()
-        self.exit_button.setText("立即返回地图")
+        self.exit_button.setText("返回地图")
 
     def clear_navigation_result(self) -> None:
         self.result_overlay.hide()
@@ -2947,6 +2977,7 @@ class NavigationWindow(QMainWindow):
         self._last_route_refresh = 0.0
         self._last_map_navigation_refresh = 0.0
         self._motion_trace = []
+        self._navigation_overlay_enabled = False
         self._compact_mode: Optional[bool] = None
         self._layout_profile = ""
         self.setWindowTitle("NAV 导航控制台")
@@ -2967,11 +2998,6 @@ class NavigationWindow(QMainWindow):
         self._set_compact_mode(min(initial_width, initial_height) < 700)
         self._load_configured_pointcloud()
         self.pending_navigation_result_status: Optional[int] = None
-        self.navigation_return_timer = QTimer(self)
-        self.navigation_return_timer.setSingleShot(True)
-        self.navigation_return_timer.setInterval(2200)
-        self.navigation_return_timer.timeout.connect(
-            self._finish_navigation_return)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setTimerType(Qt.PreciseTimer)
         self.refresh_timer.timeout.connect(self.refresh)
@@ -3172,6 +3198,8 @@ class NavigationWindow(QMainWindow):
             camera_topic=camera_topic,
             rotate_180=getattr(self.node, "robot_profile", "") == "woosh",
         )
+        if getattr(self.node, "operating_mode", "robot") == "walking":
+            self.active_page.begin_button.setToolTip("使用手柄控制行走，显示方向和到达提示")
         self.map_tools_page = self._build_map_tools_page()
         self.sensor_tools_page = self._build_sensor_tools_page()
         self.sensor_monitor_page = self._build_sensor_monitor_page()
@@ -3182,6 +3210,7 @@ class NavigationWindow(QMainWindow):
             self._camera_launch_arguments,
             self.localization_tools_controller,
             robot_profile=getattr(self.node, "robot_profile", ""),
+            operating_mode=getattr(self.node, "operating_mode", "robot"),
         )
         self.navigation_stack_page.return_requested.connect(
             self.show_system_home)
@@ -4361,6 +4390,8 @@ class NavigationWindow(QMainWindow):
         self.pages.setCurrentWidget(self.mapping_page)
 
     def _navigation_stack_status_changed(self, state):
+        if state in ("stopped", "error"):
+            self._clear_navigation_overlays()
         if state == "stopped":
             self._mapping_start_error = ""
         if state == "running":
@@ -4775,14 +4806,14 @@ class NavigationWindow(QMainWindow):
             submit_ready, reason = False, timeout_reason
         _path, robot_xy, robot_yaw = self.node.map_navigation_state()
         page.set_current_pose(robot_xy, robot_yaw)
-        stack_running = (
-            self.navigation_stack_controller.overall_state == "running")
+        stack_active = self.navigation_stack_controller.overall_state in ("starting", "running")
+        matching_ready = stack_active and self.local_grid is not None and submit_ready
         page.set_runtime(
-            submit_ready=submit_ready and self.local_grid is not None,
+            submit_ready=matching_ready,
             readiness_reason=reason,
             global_pending=controller.global_relocalize_pending,
             manual_pending=controller.manual_relocalize_pending,
-            automatic_ready=stack_running and timeout_ready,
+            automatic_ready=matching_ready,
             current_pose_available=robot_xy is not None,
             manual_state=controller.manual_relocalize_state,
             progress_text=controller.relocalization_progress(),
@@ -5519,38 +5550,46 @@ class NavigationWindow(QMainWindow):
             self.node.navigation_status = "请先在地图上完成途径点重新选择"
             self.nav_status.setText(self.node.navigation_status)
             return
-        self.navigation_return_timer.stop()
         self.pending_navigation_result_status = None
         self.active_page.clear_navigation_result()
-        self._cached_route = None
-        self._ar_frame_key = None
-        self._cached_remaining_distance = 0.0
-        self._cached_guidance = None
-        self._last_route_refresh = 0.0
-        self._last_map_navigation_refresh = 0.0
-        self._motion_trace = []
         self.last_navigation_result_revision = int(
             getattr(self.node, "navigation_result_revision", 0))
         if self.node.send_navigation_waypoints(self.waypoints):
+            self._clear_navigation_overlays()
+            self._navigation_overlay_enabled = True
             self.active_page.map_panel.set_waypoints([])
             self.active_page.map_panel.set_motion_trace(None)
             self.active_page.follow_button.setChecked(True)
-            if not (getattr(self.node, "robot_profile", "") == "woosh"
-                    and getattr(self.node, "operating_mode", "robot") == "walking"):
-                self.pages.setCurrentWidget(self.active_page)
+            self.pages.setCurrentWidget(self.active_page)
 
     def begin_navigation_guidance(self) -> None:
         if not self.node.begin_guidance():
             self.nav_status.setText(self.node.navigation_status)
             return
         self.active_page.set_preview_available(False)
+        self.pages.setCurrentWidget(self.active_page)
+
+    def _clear_navigation_overlays(self) -> None:
+        self._navigation_overlay_enabled = False
+        self._motion_trace = []
+        self._cached_route = None
+        self._ar_frame_key = None
+        self._cached_guidance = None
+        self._cached_remaining_distance = 0.0
+        self._last_route_refresh = 0.0
+        self._last_map_navigation_refresh = 0.0
+        for panel in (self.map_panel, self.active_page.map_panel):
+            panel.set_navigation_state(None, panel._robot_xy, panel._robot_yaw)
+            panel.set_motion_trace(None)
+        for panel in (self.camera_panel, self.active_page.camera_panel):
+            panel.set_frame(None, None, 0.0)
 
     def exit_navigation(self) -> None:
         if self.pending_navigation_result_status is not None:
-            self.navigation_return_timer.stop()
             self._finish_navigation_return()
             return
         self.node.cancel_navigation()
+        self._clear_navigation_overlays()
         self.active_page.clear_navigation_result()
         self.clear_selection()
         self.pages.setCurrentWidget(self.setup_page)
@@ -5562,23 +5601,23 @@ class NavigationWindow(QMainWindow):
         if revision == self.last_navigation_result_revision:
             return
         self.last_navigation_result_revision = revision
+        self._clear_navigation_overlays()
         if self.pages.currentWidget() is not self.active_page:
             return
         status = getattr(self.node, "navigation_result_status", None)
         self.pending_navigation_result_status = status
         self.active_page.show_navigation_result(
             status, str(self.node.navigation_status))
-        self.navigation_return_timer.start()
 
     def _finish_navigation_return(self) -> None:
         status = self.pending_navigation_result_status
         self.pending_navigation_result_status = None
         self.clear_selection()
-        self.active_page.map_panel.set_navigation_state(None, None, 0.0)
+        self._clear_navigation_overlays()
         self.active_page.clear_navigation_result()
         self.pages.setCurrentWidget(self.setup_page)
         if status == 4:
-            self.node.navigation_status = "导航成功，已自动返回地图"
+            self.node.navigation_status = "导航成功，已返回地图"
 
     def refresh(self) -> None:
         self._handle_navigation_terminal_state()
@@ -5603,12 +5642,13 @@ class NavigationWindow(QMainWindow):
                 self._ar_frame_key = frame_key
                 self._cached_route = (
                     self.node.projected_route(image.shape)
-                    if image is not None else None)
+                    if image is not None and self._navigation_overlay_enabled else None)
                 guidance = getattr(self.node, "guidance_state", None)
-                self._cached_guidance = guidance() if guidance is not None else None
-                self._cached_remaining_distance = (
+                self._cached_guidance = (guidance() if self._navigation_overlay_enabled
+                                         and guidance is not None else None)
+                self._cached_remaining_distance = ((
                     self._cached_guidance['remaining_m'] or 0. if self._cached_guidance is not None
-                    else self.node.remaining_distance())
+                    else self.node.remaining_distance()) if self._navigation_overlay_enabled else 0.0)
                 self._last_route_refresh = now
             self.active_page.camera_panel.set_frame(
                 image,
@@ -5616,7 +5656,9 @@ class NavigationWindow(QMainWindow):
                 self._cached_remaining_distance,
                 image_revision,
                 guidance=self._cached_guidance,
-                projection_status=getattr(self.node, "ar_status", {}).get("message", ""),
+                projection_status=(str(self.node.navigation_status)
+                    if walking is not None and walking.phase in ("planning", "preview", "error")
+                    else getattr(self.node, "ar_status", {}).get("message", "")),
             )
             if hasattr(self.node, "_image_received_at"):
                 stamp = self.node.image_stamp
@@ -5662,7 +5704,14 @@ class NavigationWindow(QMainWindow):
             and now - self._last_map_navigation_refresh >= 1.0 / 15.0
         ):
             path, robot_xy, robot_yaw = self.node.map_navigation_state()
-            if robot_xy is not None and (
+            preview = (getattr(getattr(self.node, "walking", None), "phase", "idle") == "preview"
+                       and bool(self.waypoints))
+            display_navigation = self._navigation_overlay_enabled and (
+                getattr(self.node, "navigation_active", False) or preview)
+            if not display_navigation:
+                path = None
+                self._motion_trace = []
+            if display_navigation and robot_xy is not None and (
                 not self._motion_trace
                 or np.linalg.norm(robot_xy - self._motion_trace[-1]) >= .05
             ):
@@ -5716,7 +5765,6 @@ class NavigationWindow(QMainWindow):
         self.manual_drive_page.shutdown()
         operations.shutdown()
         self.refresh_timer.stop()
-        self.navigation_return_timer.stop()
         self.navigation_stack_controller.shutdown()
         self.localization_tools_controller.shutdown()
         self.sensor_driver_controller.shutdown()

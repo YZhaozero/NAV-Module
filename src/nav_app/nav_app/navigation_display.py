@@ -58,7 +58,6 @@ def route_guidance(points, position, yaw, progress=0.):
             distance, turn = upcoming
             maneuver = '掉头' if abs(turn)>math.radians(150) else '左转' if turn>0 else '右转'
             direction = f'前方 {distance:.0f} 米{maneuver}'
-            display_angle = math.pi if maneuver=='掉头' else math.copysign(math.pi/2, turn)
     return dict(live=True, instruction=direction, progress=progress,
                 remaining_m=remaining, angle=display_angle)
 

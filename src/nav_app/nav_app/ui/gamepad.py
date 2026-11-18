@@ -18,7 +18,7 @@ class GamepadPanel(QWidget):
         self.node, self.context = node, context
         self.path = Path(os.environ.get("NAV_GAMEPAD_PROFILES", str(Path.home()/".config/nav/gamepads.json")))
         self.selected = self.profile = self.calibration = self.sample = self.subscription = None
-        self.last_stamp = None
+        self.last_pressed = []
         self.driver = RosLaunchProcess("外接手柄", self)
         self.driver.log_received.connect(self.driver_log)
         self.discovery = QProcess(self)
@@ -92,7 +92,7 @@ class GamepadPanel(QWidget):
     def disconnect_device(self):
         self.calibration = self.profile = None
         self.configuration_changed.emit()
-        self.sample = None;self.last_stamp = None
+        self.sample = None;self.last_pressed = []
         self.show_summary()
         self.driver.shutdown()
         if self.subscription is not None:
@@ -120,7 +120,20 @@ class GamepadPanel(QWidget):
         self.configuration_changed.emit();self.show_summary();self.update_buttons()
 
     def receive(self, message):
-        self.sample = (tuple(message.axes), tuple(message.buttons), time.monotonic())
+        now = time.monotonic()
+        self.sample = (tuple(message.axes), tuple(message.buttons), now)
+        pressed = [i for i, value in enumerate(message.buttons) if value]
+        if pressed:
+            self.last_pressed = pressed
+        # Process each input event so a short press is not overwritten by release.
+        if self.calibration is not None and self.calibration.stage not in ("center", "done"):
+            try:
+                self.calibration.update(self.sample, now)
+                self.instruction.setText(self.calibration.message)
+            except ValueError as error:
+                self.calibration.candidate = None
+                self.instruction.setText(str(error))
+            self.update_buttons()
 
     def begin(self):
         context = self.context()
@@ -169,19 +182,11 @@ class GamepadPanel(QWidget):
         if self.sample is not None:
             axes, buttons, stamp = self.sample
             values = " · ".join(f"{i}:{v:+.2f}" for i, v in enumerate(axes[:8]))
-            self.live.setText(f"实时轴 {values}\n按下的按钮 {[i for i,v in enumerate(buttons) if v]} · 数据年龄 {now-stamp:.2f} s")
+            self.live.setText(f"实时轴 {values}\n按下的按钮 {[i for i,v in enumerate(buttons) if v]} · 最近按下 {self.last_pressed} · 数据年龄 {now-stamp:.2f} s")
         if self.calibration is not None and self.calibration.stage not in ("center", "done"):
-            try:
-                if self.sample is None or self.sample[2] != self.last_stamp:
-                    self.calibration.update(self.sample, now)
-                    self.last_stamp = self.sample[2]
-                    self.instruction.setText(self.calibration.message)
-                elif now-self.sample[2] > .3:
-                    self.calibration.candidate = None
-                    self.instruction.setText("手柄数据中断；恢复后可继续，或取消重新标定")
-            except ValueError as error:
+            if self.sample is None or now-self.sample[2] > .3:
                 self.calibration.candidate = None
-                self.instruction.setText(str(error))
+                self.instruction.setText("手柄数据中断；恢复后可继续，或取消重新标定")
         self.update_buttons()
 
     def update_buttons(self):
