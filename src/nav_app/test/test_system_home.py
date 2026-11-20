@@ -85,6 +85,76 @@ def test_home_actions_fit_the_screen(window, application, size):
     assert window.width() == size[0] and window.height() == size[1]
 
 
+
+@pytest.mark.parametrize("size", [(800, 480), (480, 800)])
+def test_woosh_navigation_mode_switch_changes_backend_without_starting(
+    tmp_path, monkeypatch, application, size,
+):
+    from PyQt5.QtWidgets import QInputDialog
+    from nav_app.qt_nav_node import QtNavRosNode
+
+    monkeypatch.setenv("NAV_ACCESS_SETTINGS", str(tmp_path / "access.ini"))
+    monkeypatch.setenv("NAV_TASK_STATE_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setenv("NAV_LOG_DIR", str(tmp_path / "logs"))
+    changes = []
+
+    def set_parameters(params):
+        changes.append({param.name: param.value for param in params})
+        return SimpleNamespace(successful=True)
+
+    node = SimpleNamespace(robot_profile="woosh", operating_mode="walking",
+        woosh_control_mode=0, robot=SimpleNamespace(busy=False), navigation_status="等待准备",
+        map_storage_dir=str(tmp_path / "maps"), mapping_backend="woosh_native5",
+        set_parameters_atomically=set_parameters, cancel_navigation=lambda: None)
+    node.set_woosh_control_mode = lambda mode: QtNavRosNode.set_woosh_control_mode(node, mode)
+    view = NavigationWindow(node)
+    view.refresh_timer.stop()
+    view.operations_page.timer.stop()
+    try:
+        view.resize(*size)
+        view.show()
+        application.processEvents()
+        home = view.system_home_page
+        button = home.navigation_mode_button
+        assert home.rect().contains(button.mapTo(home, button.rect().bottomRight()))
+        assert "MeshNav" in button.text() and button.isEnabled()
+        access = view.navigation_access_page
+        access.fields["navigation_engine"].setCurrentIndex(access.fields["navigation_engine"].findData("nav2"))
+        access.save()
+        view._refresh_system_home()
+        assert "手柄规划" in button.text()
+        selected = [1, True]
+        monkeypatch.setattr(QInputDialog, "getItem", lambda _p, _t, _l, choices, *_a:
+                             (choices[selected[0]], selected[1]))
+        view.navigation_stack_controller.overall_state = "running"
+        view._refresh_system_home()
+        button.click()
+        assert not button.isEnabled() and not changes
+
+        view.navigation_stack_controller.overall_state = "stopped"
+        view._refresh_system_home()
+        button.click()
+        assert changes == [{"operating_mode": "robot", "woosh_control_mode": 1}]
+        config = view.navigation_stack_page.configuration()
+        assert node.operating_mode == "robot" and config.navigation_backend == "nav2"
+        assert config.woosh_control_mode == 1 and "自动行驶" in button.text()
+        assert not view._navigation_service_active()
+
+        selected[:] = [0, False]
+        button.click()
+        assert len(changes) == 1
+        selected[:] = [0, True]
+        button.click()
+        assert changes[-1] == {"operating_mode": "walking", "woosh_control_mode": 0}
+        config = view.navigation_stack_page.configuration()
+        assert config.navigation_backend == "walking" and config.woosh_control_mode == 0
+        assert "手柄规划" in button.text() and not view._navigation_service_active()
+    finally:
+        view.close()
+        application.processEvents()
+        view.operations_page.task_coordinator.thread.join(timeout=5)
+
+
 def test_maps_are_grouped_and_progress_keeps_the_same_task_owner(window):
     operations = window.operations_page
     owner = operations.task_coordinator

@@ -6,10 +6,14 @@ from .nav_math import apply_transform, make_ribbon, project_ground, snap_route_t
 
 def grounded_route(node,stamp):
     node.ar_ground_source = ''
+    mesh_route = getattr(node, '_meshnav_active', False)
+    route = node.path + [0., 0., node.ground_render_offset_m] if mesh_route else node.path
     if node.ground_frame and node.ground_frame!=node.base_frame:
         matrix=node.lookup_matrix(node.ground_frame,node.path_frame,stamp)
         if matrix is not None:
-            points=snap_route_to_ground(apply_transform(node.path,matrix),0.,node.ground_render_offset_m)
+            points=apply_transform(route,matrix)
+            if not mesh_route:
+                points=snap_route_to_ground(points,0.,node.ground_render_offset_m)
             body=node.lookup_matrix(node.ground_frame,node.base_frame,stamp)
             if body is None:return None
             delta=points-body[:3,3]
@@ -24,11 +28,13 @@ def grounded_route(node,stamp):
     body=node.lookup_matrix(frame,node.base_frame,stamp)
     path=node.lookup_matrix(frame,node.path_frame,stamp)
     if body is None or path is None:return None
-    points=snap_route_to_ground(apply_transform(node.path,path),body[2,3]-node.ground_height_m,node.ground_render_offset_m)
+    points=apply_transform(route,path)
+    if not mesh_route:
+        points=snap_route_to_ground(points,body[2,3]-node.ground_height_m,node.ground_render_offset_m)
     delta=points-body[:3,3]
     yaw=np.arctan2(body[1,0],body[0,0]);c,s=np.cos(yaw),np.sin(yaw)
     local=np.column_stack((c*delta[:,0]+s*delta[:,1],-s*delta[:,0]+c*delta[:,1],delta[:,2]))
-    node.ar_ground_source = 'configured_height'
+    node.ar_ground_source = 'mesh' if mesh_route else 'configured_height'
     return points,frame,route_range_mask(local,node.style.route_near_clip_m,node.style.route_far_clip_m)
 
 

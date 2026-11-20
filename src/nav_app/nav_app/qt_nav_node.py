@@ -6,6 +6,7 @@ import math
 import re
 import signal
 import sys
+import threading
 import time
 from pathlib import Path as FilePath
 from typing import Optional, Tuple
@@ -16,6 +17,7 @@ import yaml
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav2_msgs.action import ComputePathThroughPoses, NavigateThroughPoses
 from nav_msgs.msg import OccupancyGrid, Path, Odometry
+from std_msgs.msg import Bool
 from PyQt5.QtCore import (
     QEvent,
     QPointF,
@@ -48,6 +50,7 @@ from PyQt5.QtWidgets import (
     QFrame,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -64,6 +67,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 from rclpy.action import ActionClient
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import (
@@ -193,13 +197,16 @@ class CameraPanel(QWidget):
             self._source_size = (w, h)
             self._camera_live = True
             self._frame_revision = frame_revision
-        if route is not self._route:
+        route_changed = route is not self._route
+        if route_changed:
             self._route_geometry_key = None
-        self._route = route
-        self._distance = remaining_m
-        self._guidance = guidance
-        self.projection_status = projection_status
-        self.update()
+        if (new_frame or route_changed or remaining_m != self._distance
+                or guidance != self._guidance or projection_status != self.projection_status):
+            self._route = route
+            self._distance = remaining_m
+            self._guidance = guidance
+            self.projection_status = projection_status
+            self.update()
 
     def clear_frame(self, camera_topic: Optional[str] = None) -> None:
         if camera_topic is not None:
@@ -456,15 +463,18 @@ class CameraPanel(QWidget):
 
     def set_frame_age(self, preview_age, source_age=None):
         from .features.camera_state import camera_message
-        self._frame_message = camera_message(preview_age, source_age)
         source_current = source_age is None or -.05 <= source_age <= .5
-        self._camera_live = self._pixmap is not None and preview_age is not None and 0 <= preview_age <= .5 and source_current
-        if not source_current:
-            self._frame_message = '相机时间无效或画面延迟'
-        if not self._camera_live:
+        message = (camera_message(preview_age, source_age) if source_current
+                   else '相机时间无效或画面延迟')
+        live = self._pixmap is not None and preview_age is not None and 0 <= preview_age <= .5 and source_current
+        route_expired = not live and self._route is not None
+        if route_expired:
             self._route = None
             self._route_geometry_key = None
-        self.update()
+        if live != self._camera_live or message != self._frame_message or route_expired:
+            self._camera_live = live
+            self._frame_message = message
+            self.update()
 
 
 class MapPanel(QWidget):
@@ -538,6 +548,13 @@ class MapPanel(QWidget):
         self._last_follow_transform = QTransform()
         self._waypoints = []
         self._selected_waypoint_index: Optional[int] = None
+        self._meshnav_overlay = None
+        self._meshnav_component = None
+        self._meshnav_paths = {}
+        self._meshnav_coverage_image = None
+        self._meshnav_coverage_key = None
+        self._meshnav_rejected = None
+        self.body_overlay = ()
         self._edit_tool = "navigate"
         self._brush_radius = 0.20
         self._painting = False
@@ -1154,7 +1171,7 @@ class MapPanel(QWidget):
         robot_yaw: float,
     ) -> None:
         self._path = path
-        valid = (robot_xy is not None and np.asarray(robot_xy).shape == (2,)
+        valid = (robot_xy is not None and np.asarray(robot_xy).shape in ((2,), (3,))
                  and np.isfinite(robot_xy).all() and math.isfinite(robot_yaw))
         self._robot_xy = np.asarray(robot_xy).copy() if valid else None
         self._robot_yaw = float(robot_yaw) if valid else 0.0
@@ -1183,9 +1200,9 @@ class MapPanel(QWidget):
         if not self._navigation_follow or self._robot_xy is None:
             return
         if self._cloud_3d_enabled and self._mode == "cloud":
-            direction = np.array([
-                math.cos(self._robot_yaw), math.sin(self._robot_yaw)])
-            points = self._cloud_ground_points_from_xy(np.array([
+            direction = np.zeros_like(self._robot_xy)
+            direction[:2] = math.cos(self._robot_yaw), math.sin(self._robot_yaw)
+            points = self._cloud_navigation_points(np.array([
                 self._robot_xy, self._robot_xy + direction]))
             self._cloud_view_target = points[0]
             forward = points[1] - points[0]
@@ -1208,6 +1225,53 @@ class MapPanel(QWidget):
         transform.translate(-center.x(), -center.y())
         self._last_follow_transform = transform
         return transform
+
+    def set_meshnav_overlay(self, surface, component):
+        if surface is self._meshnav_overlay and component == self._meshnav_component:
+            return
+        if surface is not self._meshnav_overlay:
+            self._meshnav_overlay = surface
+            self._meshnav_paths = {}
+            if surface is not None:
+                for face, label in zip(surface.faces, surface.components):
+                    label = int(label)
+                    if label not in self._meshnav_paths:
+                        path = QPainterPath()
+                        path.setFillRule(Qt.WindingFill)
+                        self._meshnav_paths[label] = path
+                    self._meshnav_paths[label].addPolygon(QPolygonF([
+                        QPointF(float(x), float(y)) for x, y in surface.vertices[face, :2]]))
+                    self._meshnav_paths[label].closeSubpath()
+        self._meshnav_component = component
+        self._meshnav_coverage_key = None
+        self.update()
+
+    def set_meshnav_rejected(self, xy):
+        self._meshnav_rejected = xy
+        self.update()
+
+    def _meshnav_pixmap(self):
+        key = (self._grid_shape, tuple(self._grid_origin), self._grid_resolution, self._grid_origin_yaw)
+        if key != self._meshnav_coverage_key:
+            h, w = self._grid_shape
+            scale = min(1., 1200. / max(h, w))
+            image = QImage(max(1, int(w * scale)), max(1, int(h * scale)), QImage.Format_ARGB32_Premultiplied)
+            image.fill(Qt.transparent)
+            sx, sy = image.width() / w, image.height() / h
+            yaw, origin = self._grid_origin_yaw, self._grid_origin
+            c, s = math.cos(yaw) / self._grid_resolution, math.sin(yaw) / self._grid_resolution
+            transform = QTransform(c*sx, s*sy, s*sx, -c*sy,
+                                   -(c*origin[0]+s*origin[1])*sx,
+                                   (h-1-s*origin[0]+c*origin[1])*sy)
+            raster = QPainter(image)
+            raster.setTransform(transform)
+            for label, path in self._meshnav_paths.items():
+                connected = self._meshnav_component is None or label == self._meshnav_component
+                raster.fillPath(path, QColor(34, 196, 120, 125) if connected else QColor(244, 177, 50, 120))
+            raster.end()
+            self._meshnav_coverage_image = QPixmap.fromImage(image)
+            self._meshnav_coverage_key = key
+        return self._meshnav_coverage_image
 
     def set_waypoints(self, waypoints) -> None:
         self._waypoints = [np.asarray(point).copy() for point in waypoints]
@@ -1422,7 +1486,7 @@ class MapPanel(QWidget):
             world = self.widget_to_world(event.localPos())
             if world is not None:
                 if self._edit_tool == "navigate":
-                    self.point_selected.emit(float(world[0]), float(world[1]))
+                    self._emit_point_selected(world)
                 else:
                     self._painting = True
                     self.edit_started.emit()
@@ -1459,6 +1523,9 @@ class MapPanel(QWidget):
                 return
         super().mouseMoveEvent(event)
 
+    def _emit_point_selected(self, world):
+        self.point_selected.emit(float(world[0]), float(world[1]))
+
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == self._view_drag_button:
             select_point = (
@@ -1478,7 +1545,7 @@ class MapPanel(QWidget):
             elif select_point:
                 world = self.widget_to_world(event.localPos())
                 if world is not None:
-                    self.point_selected.emit(float(world[0]), float(world[1]))
+                    self._emit_point_selected(world)
             event.accept()
             return
         if event.button() == Qt.LeftButton:
@@ -1529,6 +1596,9 @@ class MapPanel(QWidget):
         painter.save()
         painter.setTransform(self._map_follow_transform(), True)
         painter.drawPixmap(target, pixmap, QRectF(pixmap.rect()))
+        if self._mode == "grid" and self._meshnav_overlay is not None:
+            coverage = self._meshnav_pixmap()
+            painter.drawPixmap(target, coverage, QRectF(coverage.rect()))
         painter.restore()
         painter.setClipRect(
             self.rect() if self._navigation_follow else target)
@@ -1542,6 +1612,9 @@ class MapPanel(QWidget):
             else:
                 color = QColor("#ff5f67") if is_last else QColor("#ffc857")
             self._draw_marker(painter, waypoint, color, str(index + 1))
+        if self._mode == "grid" and self._meshnav_overlay is not None and self._meshnav_rejected is not None:
+            self._draw_marker(painter, self._meshnav_rejected, QColor("#d62c42"), "×")
+        self._draw_body_overlay(painter)
         self._draw_grid_scale(painter)
 
     def grid_scale_info(self):
@@ -1789,6 +1862,9 @@ class MapPanel(QWidget):
         displayed[:, 2] += 0.04
         return displayed
 
+    def _cloud_navigation_points(self, points):
+        return self._cloud_ground_points_from_xy(np.asarray(points)[..., :2])
+
     def _draw_cloud_3d_navigation(self, painter: QPainter) -> None:
         """Overlay the active global path and robot on the 3-D ground plane."""
         if self._motion_trace is not None and len(self._motion_trace) >= 2:
@@ -1811,7 +1887,7 @@ class MapPanel(QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawPath(trace)
         if self._path is not None and len(self._path) >= 2:
-            path_points = self._cloud_ground_points_from_xy(self._path[:, :2])
+            path_points = self._cloud_navigation_points(self._path)
             screen_x, screen_y, _depth = self._project_cloud_points(path_points)
             finite = np.isfinite(screen_x) & np.isfinite(screen_y)
             valid_indices = np.flatnonzero(finite)
@@ -1829,8 +1905,7 @@ class MapPanel(QWidget):
                 painter.drawPath(path)
 
         for index, waypoint in enumerate(self._waypoints):
-            point_3d = self._cloud_ground_points_from_xy(
-                np.asarray(waypoint, dtype=np.float32)[:2])
+            point_3d = self._cloud_navigation_points(waypoint)
             screen_x, screen_y, _depth = self._project_cloud_points(point_3d)
             if not np.isfinite(screen_x[0]) or not np.isfinite(screen_y[0]):
                 continue
@@ -1846,13 +1921,13 @@ class MapPanel(QWidget):
             painter.setPen(QColor("#ffffff"))
             painter.drawText(point + QPointF(8, -7), str(index + 1))
 
+        self._draw_body_overlay(painter, cloud=True)
         if self._robot_xy is None:
             return
-        direction = np.array([
-            math.cos(self._robot_yaw), math.sin(self._robot_yaw)],
-            dtype=np.float32)
-        robot_points = self._cloud_ground_points_from_xy(np.vstack((
-            self._robot_xy[:2], self._robot_xy[:2] + direction,
+        direction = np.zeros_like(self._robot_xy)
+        direction[:2] = math.cos(self._robot_yaw), math.sin(self._robot_yaw)
+        robot_points = self._cloud_navigation_points(np.vstack((
+            self._robot_xy, self._robot_xy + direction,
         )))
         screen_x, screen_y, _depth = self._project_cloud_points(robot_points)
         if not np.all(np.isfinite(screen_x)) or not np.all(np.isfinite(screen_y)):
@@ -1876,6 +1951,28 @@ class MapPanel(QWidget):
         painter.setPen(QPen(QColor("#073346"), 1.8))
         painter.setBrush(QColor("#ffffff"))
         painter.drawPolygon(arrow)
+
+    def _draw_body_overlay(self, painter, cloud=False):
+        painter.setBrush(Qt.NoBrush)
+        for kind, xyz in self.body_overlay:
+            if cloud:
+                displayed = self.transform_cloud_points(xyz) + [0., 0., .04]
+                x, y, _ = self._project_cloud_points(displayed)
+                if not np.all(np.isfinite(x) & np.isfinite(y)):
+                    continue
+                pixels = [QPointF(float(u), float(v)) for u, v in zip(x, y)]
+            else:
+                pixels = [self.world_to_widget(point[:2]) for point in xyz]
+            conflict = kind in ("conflict", "contacts")
+            painter.setPen(QPen(QColor("#ff384e" if conflict else "#31f4e3"),
+                                2.5 if conflict else 1.8,
+                                Qt.DashLine if kind in ("envelope", "conflict") else Qt.SolidLine))
+            if kind == "contacts":
+                for point in pixels:
+                    painter.drawLine(point - QPointF(5, 5), point + QPointF(5, 5))
+                    painter.drawLine(point - QPointF(5, -5), point + QPointF(5, -5))
+            else:
+                painter.drawPolygon(QPolygonF(pixels))
 
     def _draw_global_path(self, painter: QPainter) -> None:
         if self._path is None or len(self._path) < 2:
@@ -1924,6 +2021,112 @@ class MapPanel(QWidget):
         painter.drawText(point + QPointF(10, -8), label)
 
 
+class MeshPreviewPanel(MapPanel):
+    """Independent 3-D triangle view sharing the point-cloud camera controls."""
+
+    point_selected_3d = pyqtSignal(float, float, float)
+    def __init__(self):
+        super().__init__(cloud_3d=True)
+        self.set_display_mode("cloud")
+        self._cloud_projection = "orthographic"
+        self.mesh = None
+        self._component = None
+        self._triangle_cache_key = None
+        self._triangle_image = None
+        self._triangle_projection = None
+        self.notice = "尚未加载 MeshNav 网格"
+
+    def set_mesh(self, mesh, component=None):
+        if mesh is self.mesh and component == self._component:
+            return
+        if mesh is not self.mesh:
+            self.mesh = mesh
+            if mesh is not None:
+                low, high = mesh.vertices.min(axis=0), mesh.vertices.max(axis=0)
+                self._cloud_bounds_low = low
+                self._cloud_center = (low + high) / 2
+                self._cloud_extent = np.maximum(high - low, .1)
+                self.reset_cloud_view()
+        self._component = component
+        self._triangle_cache_key = None
+        self._triangle_projection = None
+        self.update()
+
+    def _draw_triangles(self):
+        key = (id(self.mesh), self._component, self.width(), self.height(), self._cloud_azimuth,
+               self._cloud_elevation, self._cloud_zoom, tuple(self._cloud_view_target))
+        if key == self._triangle_cache_key:
+            return self._triangle_image
+        x, y, depth = self._project_cloud_points(self.mesh.vertices)
+        projected = np.column_stack((x, y, depth))[self.mesh.triangles]
+        self._triangle_projection = projected
+        image = QImage(self.size(), QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        painter.setPen(QPen(QColor("#1f4a4e"), 1))
+        green = QColor("#41a88b")
+        yellow = QColor("#d3a650")
+        for idx in np.argsort(projected[:, :, 2].mean(axis=1)):
+            face = projected[idx]
+            if self._component is not None and self.mesh.triangle_components[idx] != self._component:
+                painter.setBrush(yellow)
+            else:
+                painter.setBrush(green)
+            painter.drawPolygon(QPolygonF([QPointF(float(px), float(py)) for px, py in face[:, :2]]))
+        painter.end()
+        self._triangle_cache_key = key
+        self._triangle_image = image
+        return image
+
+    def widget_to_world(self, point):
+        if self.mesh is None:
+            return None
+        self._draw_triangles()
+        projected = self._triangle_projection
+        xy = projected[:, :, :2]
+        a, b = (xy[:, 1:] - xy[:, :1]).transpose(1, 0, 2)
+        det = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+        eligible = np.flatnonzero(np.abs(det) > 1.e-7)
+        delta = np.array([point.x(), point.y()]) - xy[eligible, 0]
+        u = (delta[:, 0] * b[eligible, 1] - delta[:, 1] * b[eligible, 0]) / det[eligible]
+        v = (a[eligible, 0] * delta[:, 1] - a[eligible, 1] * delta[:, 0]) / det[eligible]
+        inside = (u >= 0) & (v >= 0) & (u+v <= 1.)
+        if not inside.any():
+            return None
+        faces = eligible[inside]
+        weights = np.column_stack((1-u[inside]-v[inside], u[inside], v[inside]))
+        nearest = np.argmax(np.sum(weights * projected[faces, :, 2], axis=1))
+        return weights[nearest] @ self.mesh.vertices[self.mesh.triangles[faces[nearest]]]
+
+    def _emit_point_selected(self, world):
+        self.point_selected_3d.emit(*map(float, world))
+
+    def _cloud_navigation_points(self, points):
+        points = np.atleast_2d(points)
+        if points.shape[1] == 2:
+            return super()._cloud_navigation_points(points)
+        return points + [0., 0., .04]
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#0b1118"))
+        painter.setFont(QFont("Sans Serif", 10, QFont.DemiBold))
+        if self.mesh is None:
+            painter.setPen(QColor("#8999a5"))
+            painter.drawText(self.rect(), Qt.AlignCenter, self.notice)
+            return
+        self._draw_cloud_3d_reference(painter)
+        painter.drawImage(0, 0, self._draw_triangles())
+        self._draw_cloud_3d_navigation(painter)
+        painter.setFont(QFont("Sans Serif", 10, QFont.DemiBold))
+        painter.setPen(QColor("#d6e5ee"))
+        low, high = self._cloud_bounds_low[2], self.mesh.vertices[:, 2].max()
+        painter.drawText(15, 24, f"MeshNav 网格 · {len(self.mesh.triangles):,} 面 · Z {low:.2f}～{high:.2f} m")
+        painter.setFont(QFont("Sans Serif", 9))
+        painter.setPen(QColor("#8ca7b7"))
+        painter.drawText(15, self.height()-13, "拖动旋转 · 右键平移 · 滚轮缩放 · 双击复位")
+
+
 class QtNavRosNode(Node):
     """ROS-facing state and commands consumed by the Qt widgets."""
 
@@ -1956,6 +2159,12 @@ class QtNavRosNode(Node):
         self.declare_parameter("fullscreen_on_small_screen", True)
         self.declare_parameter("fullscreen", False)
         self.declare_parameter("operating_mode", "robot")
+        self.woosh_control_mode = self.declare_parameter("woosh_control_mode", 0).value
+        self._woosh_motion_enabled = False
+        self.mesh_drive = None
+        self._meshnav_client = None
+        self._meshnav_active = False
+        self._meshnav_surface = None
         self.declare_parameter("phone_remote_enabled", False)
         self.declare_parameter("phone_remote_bind", "0.0.0.0")
         self.declare_parameter("phone_remote_port", 8765)
@@ -2016,6 +2225,23 @@ class QtNavRosNode(Node):
         self._fast_navigation_odometry = False
         self._navigation_health_subscription = None
         self.require_localizer_quality = False
+
+        self.battery_percentage = None
+        self.battery_charge_state = 0
+        self.battery_received_at = None
+        self.battery_error = "等待底盘电量"
+        self._battery_client = None
+        self._battery_request = None
+        if self.robot_profile == "woosh":
+            try:
+                from woosh_robot_msgs.srv import Battery
+            except ImportError as exc:
+                self.battery_error = "电量接口不可用：" + str(exc)
+                self.get_logger().error(self.battery_error)
+            else:
+                self._battery_type = Battery
+                self._battery_client = self.create_client(Battery, "/woosh_robot/robot/Battery")
+                self._battery_timer = self.create_timer(1.0, self._poll_battery)
 
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -2112,15 +2338,23 @@ class QtNavRosNode(Node):
             self.robot_client, self._robot_changed,
             ready=self.navigation_route_ready)
         self._planned_waypoints = []
-        from std_msgs.msg import Bool, String
+        from std_msgs.msg import String
         from std_srvs.srv import SetBool
         from .features.motion_session import MotionSession
         self.motion_permit_pub = self.create_publisher(
             Bool, "/nav/motion_permit", 1)
+        self.motion_node = self
+        if self.robot_profile == "woosh":
+            # Status, arming replies and MeshNav control must keep progressing during Qt paints.
+            self.motion_node = rclpy.create_node(
+                f"nav_motion_control_{id(self):x}", context=self.context, use_global_arguments=False,
+                start_parameter_services=False)
+            self._motion_executor = SingleThreadedExecutor(context=self.context)
+            self._motion_executor.add_node(self.motion_node)
         self.motion_session = MotionSession(
-            self.create_client(SetBool, "/nav/arm_motion"),
+            self.motion_node.create_client(SetBool, "/nav/arm_motion"),
             lambda: SetBool.Request(data=True))
-        self.create_subscription(
+        self.motion_status_subscription = self.motion_node.create_subscription(
             String, "/nav/motion_status",
             lambda message: self.motion_session.update(
                 message.data, self.get_clock().now().nanoseconds),
@@ -2176,6 +2410,9 @@ class QtNavRosNode(Node):
             "actions=/compute_path_through_poses,/navigate_through_poses")
         self._route_readiness_timer = self.tf_listener.node.create_timer(
             .2, self.navigation_route_ready)
+        if self.motion_node is not self:
+            self._motion_thread = threading.Thread(target=self._motion_executor.spin, name="mesh-motion")
+            self._motion_thread.start()
 
     def set_clock_mode(self, use_sim_time: bool) -> None:
         from rclpy.parameter import Parameter
@@ -2183,7 +2420,22 @@ class QtNavRosNode(Node):
         self.set_parameters([value])
         self.tf_listener.node.set_parameters([value])
 
+    def set_woosh_control_mode(self, control_mode: int) -> None:
+        from rclpy.parameter import Parameter
+        mode = "robot" if control_mode else "walking"
+        result = self.set_parameters_atomically([
+            Parameter("operating_mode", value=mode),
+            Parameter("woosh_control_mode", value=control_mode),
+        ])
+        if not result.successful:
+            raise RuntimeError(result.reason)
+        self.operating_mode = mode
+        self.woosh_control_mode = control_mode
+
     def configure_navigation(self, config) -> None:
+        if self.mesh_drive is not None:
+            self.mesh_drive.destroy()
+            self.mesh_drive = None
         if self._navigation_health_subscription is not None:
             self.tf_listener.node.destroy_subscription(self._navigation_health_subscription)
             self._navigation_health_subscription = None
@@ -2193,10 +2445,19 @@ class QtNavRosNode(Node):
         self._last_scan_message_time = 0.
         self._planning_inputs = ()
         self._fast_navigation_odometry = False
+        if self._meshnav_active:
+            self.walking.cancel()
+            self.walking.client = self.navigation_client
+        self._meshnav_active = config is not None and config.navigation_backend == "meshnav"
+        self._meshnav_surface = None
         if config is None:  # The stack has stopped or is shutting down.
+            if self._woosh_motion_enabled:
+                self.cancel_navigation()
+            self._woosh_motion_enabled = False
             self.require_localizer_quality = False
             self._navigation_readiness.reset()
             return
+        self._woosh_motion_enabled = bool(config.woosh_control_mode)
         self.set_clock_mode(config.use_sim_time)
         self._odometry_backend = config.odometry_backend
         self._fast_navigation_odometry = config.robot_profile == "woosh" and config.odometry_backend == "fast_livo"
@@ -2209,8 +2470,33 @@ class QtNavRosNode(Node):
                 QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
         input_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                history=HistoryPolicy.KEEP_LAST, depth=5)
-        self._navigation_input_subscriptions.append((self.tf_listener.node, self.tf_listener.node.create_subscription(
-            LaserScan, config.scan_topic, self._on_navigation_scan_data, input_qos)))
+        if self._meshnav_active:
+            from mbf_msgs.action import GetPath
+            from mesh_msgs.msg import MeshGeometryStamped
+
+            if self._meshnav_client is None:
+                self._meshnav_client = ActionClient(self, GetPath, "/mbf_mesh_nav/get_path")
+            self.walking.client = self._meshnav_client
+            mesh_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self._navigation_input_subscriptions.append((self, self.create_subscription(
+                MeshGeometryStamped, "/mbf_mesh_nav/mesh", self._on_meshnav_geometry, mesh_qos)))
+        if self._meshnav_active and self._woosh_motion_enabled:
+            from .features.mesh_drive import MeshDrive
+            self.mesh_drive = MeshDrive(self)
+            drive = self.mesh_drive
+            owner = self.tf_listener.node
+            if not self._fast_navigation_odometry:
+                backend = config.odometry_backend
+                topic = config.external_odom_topic if backend == "external" else "/dlio/odom_node/odom"
+                self._navigation_health_subscription = owner.create_subscription(
+                    Odometry, topic, lambda msg: self._record_odometry_time(msg, backend)
+                    if backend != "external" or msg.header.frame_id == "odom" else None, input_qos)
+            cloud_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+            self._navigation_input_subscriptions.append((owner, owner.create_subscription(
+                PointCloud2, config.mesh_cloud_topic, drive.clouds.append, cloud_qos)))
+        if not self._meshnav_active:
+            self._navigation_input_subscriptions.append((self.tf_listener.node, self.tf_listener.node.create_subscription(
+                LaserScan, config.scan_topic, self._on_navigation_scan_data, input_qos)))
         if config.odometry_backend == "external":
             self._navigation_input_subscriptions.append((self, self.create_subscription(
                 Odometry, config.external_odom_topic, self._on_external_odometry, input_qos)))
@@ -2224,9 +2510,9 @@ class QtNavRosNode(Node):
                 QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                            history=HistoryPolicy.KEEP_LAST, depth=2))
         self.require_localizer_quality = config.localization_backend == "pointcloud_localizer"
-        if config.navigation_backend == "walking" and not config.use_sim_time:
+        if (config.navigation_backend in ("walking", "meshnav") or self._woosh_motion_enabled) and not config.use_sim_time:
             self._planning_inputs = (
-                ("scan", "等待实时 scan；路线规划已暂停"),
+                *((("scan", "等待实时 scan；路线规划已暂停"),) if not self._meshnav_active else ()),
                 ("external_odom" if config.odometry_backend == "external" else "dlio", "等待有效里程计；路线规划已暂停"),
                 ("localizer" if self.require_localizer_quality else "external_localization", "等待地图定位，请使用重新定位"),
             )
@@ -2269,6 +2555,9 @@ class QtNavRosNode(Node):
                 quaternion=list(values[3:]),
                 covariance=list(message.pose.covariance),
             ))
+        self._record_odometry_time(message, backend)
+
+    def _record_odometry_time(self, message, backend):
         stamp = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
         age = (self.get_clock().now().nanoseconds - stamp) / 1e9
         if stamp > 0 and -.1 <= age <= 1.:
@@ -2290,6 +2579,18 @@ class QtNavRosNode(Node):
         self.amcl_initial_pose_pub.publish(message)
         self._amcl_initial_pose_time = time.monotonic()
         return True, "初始位姿已发送，等待 AMCL 确认定位"
+
+    def _on_meshnav_geometry(self, message) -> None:
+        if self._meshnav_active and message.header.frame_id == self.map_frame:
+            from .features.meshnav_maps import MeshSurface
+
+            try:
+                self._meshnav_surface = MeshSurface(
+                    [(p.x, p.y, p.z) for p in message.mesh_geometry.vertices],
+                    [face.vertex_indices for face in message.mesh_geometry.faces])
+            except ValueError as exc:
+                self._meshnav_surface = None
+                self.navigation_status = str(exc)
 
     def _on_navigation_scan_data(self, message) -> None:
         stamp = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
@@ -2329,9 +2630,13 @@ class QtNavRosNode(Node):
         return True
 
     def navigation_route_ready(self) -> bool:
-        ready = self._navigation_readiness.ready(
-            self.navigation_client.server_is_ready(),
-            self.robot_client.server_is_ready())
+        if self._meshnav_active:
+            ready = self._meshnav_client.server_is_ready() and self._meshnav_surface is not None
+            self._navigation_readiness.reason = "" if ready else "等待 MeshNav 加载网格和路线服务"
+        else:
+            ready = self._navigation_readiness.ready(
+                self.navigation_client.server_is_ready(),
+                self.robot_client.server_is_ready())
         for key, reason in self._planning_inputs:
             if not self.navigation_component_ready(key):
                 self._navigation_readiness.reason = reason
@@ -2358,7 +2663,43 @@ class QtNavRosNode(Node):
             self.cancel_navigation()
             self.navigation_status = "地图定位失效，已请求取消导航；请重新定位"
 
+    def _poll_battery(self) -> None:
+        now = time.monotonic()
+        if self._battery_request is not None:
+            if self._battery_request.done():
+                try:
+                    info = self._battery_request.result().info
+                    if not 0 <= info.power <= 100 or info.charge_state.value not in (0, 1, 2, 3):
+                        raise ValueError("底盘电量或充电状态无效")
+                except (RuntimeError, ValueError) as exc:
+                    self.battery_error = str(exc)
+                    self.get_logger().error(self.battery_error)
+                else:
+                    self.battery_percentage = info.power
+                    self.battery_charge_state = info.charge_state.value
+                    self.battery_received_at = now
+                    self.battery_error = ""
+                self._battery_request = None
+            elif now - self._battery_request_at >= 2.0:
+                self._battery_client.remove_pending_request(self._battery_request)
+                self._battery_request = None
+                self.battery_error = "底盘电量请求超时"
+            else:
+                return
+        if self._battery_client.service_is_ready():
+            self._battery_request = self._battery_client.call_async(self._battery_type.Request())
+            self._battery_request_at = now
+        else:
+            self.battery_error = "底盘电量服务未连接"
+
     def destroy_node(self):
+        if self.mesh_drive is not None:
+            self.mesh_drive.destroy()
+            self.mesh_drive = None
+        if self.motion_node is not self:
+            self._motion_executor.shutdown()
+            self._motion_thread.join()
+            self.motion_node.destroy_node()
         self.rtk_live.stop()
         self.outdoor_adapter.close()
         self.trajectory_test.close()
@@ -2386,6 +2727,10 @@ class QtNavRosNode(Node):
                     image, msg.header.stamp, received,
                     self.camera_frame_override or msg.header.frame_id,
                     msg.header.frame_id))
+        elif (not self._image_time_buffer.frames
+              or self._image_time_buffer.frames[-1].image is self.latest_image):
+            return
+
         def ready(frame):
             if not self.navigation_active or len(self.path) < 2:
                 return True
@@ -2427,6 +2772,8 @@ class QtNavRosNode(Node):
         return last_message > 0.0 and time.monotonic() - last_message < 2.0
 
     def _on_path(self, msg: Path, source_topic: Optional[str] = None) -> None:
+        if getattr(self, "mesh_drive", None) is not None:
+            return  # The GetPath result owns the confirmed MeshNav route.
         if not self.navigation_active:
             if self.walking.phase != "preview":
                 self.clear_navigation_path()
@@ -2558,6 +2905,10 @@ class QtNavRosNode(Node):
         self.ar_status = dict(code="route", message="等待规划路线")
 
     def send_navigation_waypoints(self, waypoints) -> bool:
+        drive = getattr(self, "mesh_drive", None)
+        if drive is not None and drive.phase != "idle":
+            self.navigation_status = "请先停止并退出当前自动行驶任务"
+            return False
         if not waypoints:
             self.navigation_status = "请先添加途径点"
             return False
@@ -2574,8 +2925,13 @@ class QtNavRosNode(Node):
         if self.robot.busy:
             self.navigation_status = "请先取消当前机器人任务并等待确认"
             return False
+        if self._meshnav_active:
+            return self._plan_meshnav(waypoints)
         if self.walking_pose()[0] is None:
             self.navigation_status = "当前位置未确认，请先完成定位"
+            return False
+        if any(len(point) == 3 for point in waypoints):
+            self.navigation_status = "当前路线含 MeshNav 三维途径点，请清空后在当前地图重新选点"
             return False
         goal_msg = ComputePathThroughPoses.Goal()
         goal_msg.use_start = False
@@ -2602,8 +2958,93 @@ class QtNavRosNode(Node):
         self.navigation_result_status = None
         return self.walking.plan(goal_msg)
 
+    def meshnav_start(self):
+        if self._meshnav_surface is None:
+            return None
+        matrix = self.lookup_matrix(self.map_frame, self.ground_frame)
+        if matrix is None:
+            matrix = self.lookup_matrix(self.map_frame, self.base_frame)
+        return (self._meshnav_surface.point(matrix[:3, 3], max_height_error=.30)
+                if matrix is not None else None)
+
+    def meshnav_target(self, point, start):
+        point = np.asarray(point)
+        if len(point) == 3:
+            target = self._meshnav_surface.point(point, max_height_error=.04)
+        else:
+            transform = self.lookup_matrix(self.map_frame, self.grid_frame)
+            if transform is None:
+                raise ValueError("栅格与 MeshNav 网格的坐标变换未就绪")
+            xy = (transform[:2, :2] @ point) + transform[:2, 3]
+            target = self._meshnav_surface.point((*xy, start[0][2]))
+        if target is None:
+            raise ValueError("选点不在 MeshNav 网格覆盖内，请选择绿色区域")
+        if target[1] != start[1]:
+            raise ValueError("选点所在网格与当前位置不连通，请选择绿色区域")
+        return target
+
+    def _plan_meshnav(self, waypoints):
+        from mbf_msgs.action import GetPath
+
+        self.walking.cancel()
+        anchor = self.meshnav_start()
+        if anchor is None:
+            pose = self.lookup_matrix(self.map_frame, self.base_frame)
+            if pose is not None:
+                center = pose[:3, 3]
+                self.walking.body_conflict = np.empty((0, 3)), center[None, :]
+            self.navigation_status = "当前位置不在 MeshNav 网格覆盖内，请核对定位和地面覆盖"
+            return False
+        selected = [anchor[0]]
+        try:
+            for point in waypoints:
+                anchor = self.meshnav_target(point, anchor)
+                if not np.allclose(anchor[0], selected[-1]):
+                    selected.append(anchor[0])
+        except ValueError as exc:
+            self.navigation_status = str(exc)
+            return False
+        if len(selected) < 2:
+            self.navigation_status = "目的地与当前位置重合，请重新选点"
+            return False
+
+        component = anchor[1] if self.robot_profile == "woosh" else None
+        start_yaw = None
+        if component is not None:
+            pose = self.lookup_matrix(self.map_frame, self.base_frame)
+            if pose is None:
+                self.navigation_status = "等待底盘朝向，请核对定位"
+                return False
+            start_yaw = math.atan2(pose[1, 0], pose[0, 0])
+            conflict = self._meshnav_surface.body_conflict([selected[0]], component, start_yaw=start_yaw)
+            if conflict is not None:
+                self.walking.body_conflict = conflict
+                self.navigation_status = "起点处车体越界，请查看地图红叉"
+                return False
+        goals = []
+        for start, target in zip(selected, selected[1:]):
+            goal = GetPath.Goal()
+            goal.use_start_pose = True
+            goal.planner = "surface"
+            for pose, xyz in ((goal.start_pose, start), (goal.target_pose, target)):
+                pose.header.stamp = self.get_clock().now().to_msg()
+                pose.header.frame_id = self.map_frame
+                pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = map(float, xyz)
+                pose.pose.orientation.w = 1.0
+            goals.append(goal)
+        self.walking.frame = self.map_frame
+        self.cancel_pending = False
+        self.navigation_result_status = None
+        if self.mesh_drive is not None:
+            self.mesh_drive.surface = self._meshnav_surface
+        return self.walking.plan(goals[0], remaining_goals=goals[1:], dimensions=3,
+                                 surface=self._meshnav_surface, body_component=component, start_yaw=start_yaw)
+
     def walking_pose(self):
         _path, xy, yaw = self.map_navigation_state()
+        if self._meshnav_active and xy is not None:
+            start = self.meshnav_start()
+            return (None if start is None else start[0]), yaw
         return xy, yaw
 
     def _walking_changed(self, session) -> None:
@@ -2623,6 +3064,8 @@ class QtNavRosNode(Node):
         self._route_ribbon_key = None
 
     def begin_guidance(self) -> bool:
+        if getattr(self, "mesh_drive", None) is not None and self.operating_mode == "robot":
+            return self.mesh_drive.begin()
         if not self.navigation_route_ready():
             self.navigation_status = (
                 self._navigation_readiness.reason or "路线服务尚未激活")
@@ -2635,7 +3078,14 @@ class QtNavRosNode(Node):
         if self.operating_mode == "robot":
             motion_session = getattr(self, "motion_session", None)
             if motion_session is None or not motion_session.available():
-                self.navigation_status = "底盘未连接或反馈未就绪，请检查底盘连接"
+                self.navigation_status = (motion_session.base_reason() if motion_session is not None else "") or (
+                    "底盘未连接或反馈未就绪，请检查底盘连接")
+                return False
+            if self.robot_profile == "woosh" and (
+                not self._woosh_motion_enabled or motion_session.state.get("ready_to_start") is not True
+            ):
+                self.navigation_status = motion_session.base_reason() or (
+                    "底盘尚未具备自动行驶条件，请检查模式、急停和静止反馈")
                 return False
             if self.walking.phase != "preview" or not self._planned_waypoints:
                 return False
@@ -2673,18 +3123,22 @@ class QtNavRosNode(Node):
         self.robot.poll()
         if self.operating_mode == "walking":
             self.walking.update_pose(*self.walking_pose())
-        elif self.robot.phase == "running" and self.walking_pose()[0] is None:
-            self.robot.cancel()
-        from std_msgs.msg import Bool
-        motion_allowed = bool(
-            self.operating_mode == "robot"
-            and self.robot.phase == "running"
-            and self.walking_pose()[0] is not None)
+        if getattr(self, "mesh_drive", None) is not None:
+            return  # This session owns its permit, arm and stop cycle.
+        motion_allowed = self.operating_mode == "robot" and self.robot.phase == "running"
+        if motion_allowed:
+            motion_allowed = self.walking_pose()[0] is not None and (
+                self.robot_profile != "woosh" or
+                self._woosh_motion_enabled and self.navigation_route_ready()
+            )
+            if not motion_allowed:
+                self.cancel_navigation()
+                self.navigation_status = "导航输入或执行服务失效，已请求停车"
         self.motion_permit_pub.publish(Bool(data=motion_allowed))
         error = self.motion_session.poll(
             self.robot.generation, motion_allowed)
         if error:
-            self.robot.cancel()
+            self.cancel_navigation()
             self.navigation_status = error
 
     def _on_goal_response(self, future) -> None:
@@ -2738,7 +3192,12 @@ class QtNavRosNode(Node):
         self.navigation_result_revision += 1
 
     def cancel_navigation(self) -> None:
+        drive = getattr(self, "mesh_drive", None)
+        if drive is not None and drive.phase != "idle":
+            drive.stop("自动行驶已取消", "exit")
         self.navigation_active = False
+        if getattr(self, "_woosh_motion_enabled", False):
+            self.motion_permit_pub.publish(Bool(data=False))
         if hasattr(self, "walking"):
             self.walking.cancel()
         if hasattr(self, "robot") and self.robot.busy:
@@ -2777,7 +3236,7 @@ class QtNavRosNode(Node):
 
 
 class ActiveNavigationPage(QWidget):
-    """Distraction-free camera view used while a task is active."""
+    """Navigation view with interchangeable map and camera panels."""
 
     def __init__(
         self, exit_callback, mode_callback=None, begin_callback=None,
@@ -2785,10 +3244,24 @@ class ActiveNavigationPage(QWidget):
     ) -> None:
         super().__init__()
         self._mode_callback = mode_callback
+        self._map_primary = False
+        self.view_button = QPushButton("地图全屏", self)
+        self.view_button.setObjectName("secondaryButton")
+        self.view_button.setToolTip("切换地图与相机的主画面，保留实时小窗")
+        self.view_button.clicked.connect(self.toggle_primary_view)
+        self.navigation_summary = QLabel(self)
+        self.navigation_summary.setTextFormat(Qt.PlainText)
+        self.navigation_summary.setWordWrap(True)
+        self.navigation_summary.setStyleSheet(
+            "background: rgba(7, 12, 18, 220); color: #e1f5ff; "
+            "border-radius: 10px; padding: 10px; font-size: 14px;")
+        self.navigation_summary.hide()
         self.camera_panel = CameraPanel(
             show_status=True, fill=True, camera_topic=camera_topic, rotate_180=rotate_180)
+        self.camera_panel.setMinimumSize(0, 0)
         self.camera_panel.setParent(self)
         self.map_panel = MapPanel(cloud_3d=True)
+        self.map_panel.setMinimumSize(0, 0)
         self.map_panel.setObjectName("activeMap")
         self.map_panel.set_edit_tool("navigate", 0.20)
         self.map_panel.setParent(self)
@@ -2823,6 +3296,9 @@ class ActiveNavigationPage(QWidget):
         self.begin_button.clicked.connect(begin_callback)
         self.begin_button.setParent(self)
         self.begin_button.hide()
+        self.manual_button = QPushButton("停止并切回手柄", self)
+        self.manual_button.setObjectName("secondaryButton")
+        self.manual_button.hide()
         self.result_overlay = QLabel(self)
         self.result_overlay.setObjectName("navigationResultOverlay")
         self.result_overlay.setAlignment(Qt.AlignCenter)
@@ -2862,6 +3338,8 @@ class ActiveNavigationPage(QWidget):
         self.exit_button.setText("退出导航")
 
     def set_preview_available(self, available: bool) -> None:
+        if self.begin_button.isHidden() != bool(available):
+            return
         self.begin_button.setVisible(bool(available))
         if available:
             self.begin_button.raise_()
@@ -2873,10 +3351,17 @@ class ActiveNavigationPage(QWidget):
         if notify and self._mode_callback is not None:
             self._mode_callback(mode)
 
+    def toggle_primary_view(self) -> None:
+        self._map_primary = not self._map_primary
+        self.view_button.setText("相机全屏" if self._map_primary else "地图全屏")
+        self._layout_panels()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._layout_panels()
+
+    def _layout_panels(self) -> None:
         compact = min(self.width(), self.height()) < 700
-        self.camera_panel.setGeometry(self.rect())
         if self.width() < self.height():
             map_w = min(260, max(180, int(self.width() * 0.44)))
         else:
@@ -2884,11 +3369,24 @@ class ActiveNavigationPage(QWidget):
         map_h = int(map_w * 0.68)
         map_x = 10 if compact else 26
         map_y = self.height() - map_h - (78 if compact else 88)
-        self.camera_panel.set_status_visible(True)
-        self.map_panel.setGeometry(map_x, map_y, map_w, map_h)
-        self.grid_mode_button.setGeometry(map_x + 10, map_y + 8, 58, 30)
-        self.cloud_mode_button.setGeometry(map_x + 72, map_y + 8, 58, 30)
-        self.follow_button.setGeometry(map_x + 134, map_y + 8, 58, 30)
+        self.camera_panel.set_status_visible(not self._map_primary)
+        self.navigation_summary.setVisible(self._map_primary)
+        if self._map_primary:
+            self.map_panel.setGeometry(self.rect())
+            self.map_panel.lower()
+            self.camera_panel.setGeometry(self.width() - map_w - map_x,
+                                          self.height() - map_h - 16, map_w, map_h)
+            self.camera_panel.raise_()
+            controls_x, controls_y = map_x, 104 if compact else 114
+        else:
+            self.camera_panel.setGeometry(self.rect())
+            self.camera_panel.lower()
+            self.map_panel.setGeometry(map_x, map_y, map_w, map_h)
+            self.map_panel.raise_()
+            controls_x, controls_y = map_x + 10, map_y + 8
+        self.grid_mode_button.setGeometry(controls_x, controls_y, 58, 30)
+        self.cloud_mode_button.setGeometry(controls_x + 62, controls_y, 58, 30)
+        self.follow_button.setGeometry(controls_x + 124, controls_y, 58, 30)
         button_w = min(190, max(150, self.width() - 120))
         button_h = 36 if compact else 40
         inset_x, inset_y = (8, 6) if compact else (22, 18)
@@ -2900,6 +3398,12 @@ class ActiveNavigationPage(QWidget):
             button_w,
             button_h,
         )
+        self.manual_button.setGeometry(self.width() - button_w - inset_x,
+                                       inset_y + 2 * (button_h + 8), button_w, button_h)
+        self.view_button.setGeometry(self.width() - button_w - inset_x,
+                                     inset_y + 3 * (button_h + 8), button_w, button_h)
+        summary_w = min(340, self.width() - button_w - inset_x - map_x - 10)
+        self.navigation_summary.setGeometry(map_x, inset_y, summary_w, 88)
         self.exit_button.setToolTip("结束当前导航并返回地图")
         self.camera_panel.status_right_margin = button_w + inset_x + 8
         overlay_w = min(500, max(240, self.width() - 28))
@@ -2910,7 +3414,9 @@ class ActiveNavigationPage(QWidget):
             overlay_w,
             overlay_h,
         )
-        self.map_panel.raise_()
+        self.navigation_summary.raise_()
+        self.view_button.raise_()
+        self.manual_button.raise_()
         self.grid_mode_button.raise_()
         self.cloud_mode_button.raise_()
         self.follow_button.raise_()
@@ -3017,7 +3523,7 @@ class NavigationWindow(QMainWindow):
         title = QLabel("NAV")
         self.main_title_label = title
         title.setObjectName("title")
-        subtitle = QLabel("实时相机 · 栅格地图 · Nav2 全局导航")
+        subtitle = QLabel("实时相机 · 导航地图")
         subtitle.setObjectName("subtitle")
         title_box = QVBoxLayout()
         title_box.setSpacing(1)
@@ -3104,21 +3610,42 @@ class NavigationWindow(QMainWindow):
         self.map_mode_group.addButton(self.cloud_mode_button)
         self.grid_mode_button.clicked.connect(
             lambda: self.set_navigation_map_mode("grid"))
+        self.cloud_mode_button.setText("PCD 点云")
         self.cloud_mode_button.clicked.connect(
             lambda: self.set_navigation_map_mode("cloud"))
+        self.mesh_mode_button = QPushButton("Mesh 网格")
+        self.mesh_mode_button.setObjectName("mapModeButton")
+        self.mesh_mode_button.setCheckable(True)
+        self.map_mode_group.addButton(self.mesh_mode_button)
+        self.mesh_mode_button.clicked.connect(lambda: self.set_navigation_map_mode("mesh"))
         map_header.addWidget(self.grid_mode_button)
         map_header.addWidget(self.cloud_mode_button)
+        map_header.addWidget(self.mesh_mode_button)
         map_layout.addLayout(map_header)
         self.map_panel = MapPanel(cloud_3d=True)
         self.map_panel.setObjectName("mapPanel")
         self.map_panel.point_selected.connect(self.on_map_point)
         self.map_panel.set_edit_tool("navigate", 0.20)
-        map_layout.addWidget(self.map_panel, 1)
+        self.navigation_mesh_panel = MeshPreviewPanel()
+        self.navigation_mesh_panel.point_selected_3d.connect(self.on_map_point)
+        from .ui.background_task import BackgroundTask
+        self.navigation_mesh_worker = BackgroundTask(self)
+        self.navigation_mesh_path = None
+        self.navigation_mesh_preview = None
+        self.navigation_map_views = QStackedWidget()
+        self.navigation_map_views.addWidget(self.map_panel)
+        self.navigation_map_views.addWidget(self.navigation_mesh_panel)
+        map_layout.addWidget(self.navigation_map_views, 1)
 
         hint = QLabel(
             "单击添加途径点；点云模式可左键拖动旋转、右键平移、滚轮缩放")
         hint.setObjectName("hint")
         map_layout.addWidget(hint)
+        self.meshnav_hint = QLabel()
+        self.meshnav_hint.setWordWrap(True)
+        self.meshnav_hint.setObjectName("hint")
+        self.meshnav_hint.hide()
+        map_layout.addWidget(self.meshnav_hint)
         self.setup_map_card = map_card
         splitter.addWidget(map_card)
 
@@ -3200,6 +3727,7 @@ class NavigationWindow(QMainWindow):
         )
         if getattr(self.node, "operating_mode", "robot") == "walking":
             self.active_page.begin_button.setToolTip("使用手柄控制行走，显示方向和到达提示")
+        self.active_page.manual_button.clicked.connect(self._mesh_manual_takeover)
         self.map_tools_page = self._build_map_tools_page()
         self.sensor_tools_page = self._build_sensor_tools_page()
         self.sensor_monitor_page = self._build_sensor_monitor_page()
@@ -3211,6 +3739,7 @@ class NavigationWindow(QMainWindow):
             self.localization_tools_controller,
             robot_profile=getattr(self.node, "robot_profile", ""),
             operating_mode=getattr(self.node, "operating_mode", "robot"),
+            woosh_control_mode=getattr(self.node, "woosh_control_mode", 0),
         )
         self.navigation_stack_page.return_requested.connect(
             self.show_system_home)
@@ -3251,7 +3780,7 @@ class NavigationWindow(QMainWindow):
             self.navigation_stack_controller.overall_state not in ("starting", "running", "stopping"),
             "导航系统尚未停止，请先停止导航系统")
         if hasattr(self.node, "configure_navigation"):
-            self.navigation_stack_controller.configure_navigation = self.node.configure_navigation
+            self.navigation_stack_controller.configure_navigation = self._configure_navigation
             self.mapping_controller.configure_clock = self.node.set_clock_mode
         self.mapping_page.return_requested.connect(self.show_mapping)
         self.pages = QStackedWidget()
@@ -3292,9 +3821,10 @@ class NavigationWindow(QMainWindow):
         self.manual_drive_page = ManualDrivePage(self)
         self.pages.addWidget(self.manual_drive_page)
         from .ui.system_home import SystemHomePage, SystemSettingsPage
-        self.system_home_page = SystemHomePage()
+        self.system_home_page = SystemHomePage(woosh=getattr(self.node, "robot_profile", "") == "woosh")
         self.system_home_page.mapping_requested.connect(self.start_mapping_from_home)
         self.system_home_page.navigation_requested.connect(self.enter_navigation)
+        self.system_home_page.navigation_mode_requested.connect(self.choose_woosh_navigation_mode)
         self.system_home_page.maps_requested.connect(self.show_map_library)
         self.system_home_page.settings_requested.connect(self.show_system_settings)
         self.system_home_page.phone_requested.connect(self.show_phone_remote)
@@ -3315,6 +3845,8 @@ class NavigationWindow(QMainWindow):
         self.pages.insertWidget(1, self.system_settings_page)
         self.pages.setCurrentWidget(self.system_home_page)
         self._refresh_system_home()
+        if getattr(self.node, "_battery_client", None) is not None:
+            QTimer.singleShot(0, self.manual_drive_page.start_agent)
         self._closing_after_record = False
         self.operations_page.controller.record_process.state_changed.connect(
             lambda state: self._record_close_state("record", state))
@@ -4124,10 +4656,6 @@ class NavigationWindow(QMainWindow):
         self.camera_panel.setMaximumHeight(camera_max_height)
         self.waypoint_list.setMinimumHeight(
             42 if landscape else (68 if compact else 130))
-        self.active_page.camera_panel.setMinimumSize(
-            120 if compact else 640, 76 if compact else 420)
-        self.active_page.map_panel.setMinimumSize(
-            180 if compact else 260, 170 if compact else 200)
 
         if portrait:
             self.setup_splitter.setSizes([360, 300])
@@ -4615,6 +5143,22 @@ class NavigationWindow(QMainWindow):
 
     def _refresh_system_home(self) -> None:
         home = self.system_home_page
+        received = getattr(self.node, "battery_received_at", None)
+        percentage = getattr(self.node, "battery_percentage", None)
+        battery_error = getattr(self.node, "battery_error", "等待底盘电量")
+        fresh = received is not None and time.monotonic() - received <= 5.0
+        if fresh and not battery_error:
+            charge = {0: "充电状态未知", 1: "未充电", 2: "充电中", 3: "自动充电中"}[
+                self.node.battery_charge_state]
+            home.battery.setText(f"底盘电量 {percentage}% · {charge}")
+            color = "#ff737b" if percentage <= 20 else "#ffd166" if percentage <= 40 else "#60dfa4"
+        else:
+            previous = f"（上次 {percentage}%）" if percentage is not None else ""
+            reason = "数据已过期" if received is not None and not fresh else (battery_error or "等待底盘电量")
+            home.battery.setText(f"底盘电量 -- · {reason}{previous}")
+            color = "#9fb9c7"
+        home.battery.setStyleSheet(f"color: {color}; font-weight: 650; font-size: 14px;")
+        home.battery.setToolTip("只读 /woosh_robot/robot/Battery，约每秒更新；5 秒未更新视为过期。" + battery_error)
         mapping = self.mapping_controller.process.active
         navigation = self.navigation_stack_controller.overall_state
         state = "建图中" if mapping else {
@@ -4634,6 +5178,15 @@ class NavigationWindow(QMainWindow):
         nav_label = "残留组件运行中" if nav_active and navigation in ("error", "stopped") else labels[navigation]
         home.navigation_state.setText("导航服务：" + nav_label)
         home.navigation_stop_button.setEnabled(nav_active and navigation != "stopping")
+        page = self.navigation_stack_page
+        mesh = page.navigation_backend.currentData() == "meshnav"
+        mode_label = "手柄规划" if page.operating_mode == "walking" else "自动行驶"
+        if mesh:
+            mode_label = "MeshNav · " + mode_label
+        home.navigation_mode_button.setText(f"导航模式 · {mode_label}")
+        home.navigation_mode_button.setEnabled(not nav_active)
+        home.navigation_mode_button.setToolTip(
+            "请先停止导航再切换" if nav_active else "切换导航模式")
         snapshot = self.operations_page.task_coordinator.snapshot()
         active_jobs = [job for job in snapshot["jobs"] if job["state"] in ("running", "cancelling")]
         waiting = sum(job["state"] in ("queued", "waiting_foreground") for job in snapshot["jobs"])
@@ -4661,11 +5214,34 @@ class NavigationWindow(QMainWindow):
             home.status.style().unpolish(home.status)
             home.status.style().polish(home.status)
 
+    def choose_woosh_navigation_mode(self) -> None:
+        if self._navigation_service_active() or self.node.robot.busy:
+            return
+        choices = ["手柄规划", "自动行驶 · 底盘模式 1（自动）", "自动行驶 · 底盘模式 2（手动）"]
+        page = self.navigation_stack_page
+        choice, accepted = QInputDialog.getItem(
+            self, "切换导航模式", "自动行驶请选择厂家确认的底盘模式。",
+            choices, page.woosh_control_mode, False)
+        if not accepted or self._navigation_service_active() or self.node.robot.busy:
+            return
+        control_mode = choices.index(choice)
+        mode = "robot" if control_mode else "walking"
+        if (mode, control_mode) != (page.operating_mode, page.woosh_control_mode):
+            self.node.cancel_navigation()
+            self.node.set_woosh_control_mode(control_mode)
+            page.set_operating_mode(mode, control_mode)
+            self._clear_navigation_overlays()
+            self.active_page.begin_button.setToolTip(
+                "确认路线后让小车自动行驶" if control_mode else "使用手柄控制行走，显示方向和到达提示")
+            self._refresh_system_home()
+
     def enter_navigation(self) -> None:
         self.show_navigation_setup()
         if self.navigation_stack_controller.overall_state in ("starting", "running"):
             return
         page = self.navigation_stack_page
+        if page.navigation_backend.currentData() == "meshnav":
+            self.set_navigation_map_mode("grid")
         if (not page.navigation_map.text().strip() or
                 page.localization_backend.currentData() == "pointcloud_localizer" and not page.localization_map.text().strip()):
             self.node.navigation_status = "请先在地图管理中选择完整地图包，再进入导航"
@@ -4688,6 +5264,11 @@ class NavigationWindow(QMainWindow):
     def show_navigation_setup(self) -> None:
         """Return to AR navigation without starting or cancelling a task."""
         self.pages.setCurrentWidget(self.setup_page)
+
+    def _configure_navigation(self, config) -> None:
+        self.node.configure_navigation(config)
+        if config is not None and config.woosh_control_mode:
+            self.manual_drive_page.start_agent()
 
     def navigation_localization_backend(self):
         config = self.navigation_stack_controller.active_config
@@ -4830,10 +5411,53 @@ class NavigationWindow(QMainWindow):
 
     def set_navigation_map_mode(self, mode: str) -> None:
         """Set map type for navigation setup and the active mini-map only."""
-        self.map_panel.set_display_mode(mode)
-        self.active_page.set_map_mode(mode, notify=False)
+        self.navigation_map_views.setCurrentWidget(self.navigation_mesh_panel if mode == "mesh" else self.map_panel)
+        if mode == "mesh":
+            self.active_page.set_map_mode("grid", notify=False)
+            self._load_navigation_mesh_preview()
+        else:
+            self.map_panel.set_display_mode(mode)
+            self.active_page.set_map_mode(mode, notify=False)
         self.grid_mode_button.setChecked(mode == "grid")
         self.cloud_mode_button.setChecked(mode == "cloud")
+        self.mesh_mode_button.setChecked(mode == "mesh")
+
+    def _load_navigation_mesh_preview(self):
+        from .features.meshnav_maps import load_mesh_surface
+        from .features.navigation_backends import NAVIGATION_BACKENDS
+
+        panel = self.navigation_mesh_panel
+        config = self.navigation_stack_page.configuration()
+        path = NAVIGATION_BACKENDS["meshnav"].mesh_path(config)
+        if path == self.navigation_mesh_path and self.navigation_mesh_preview is not None and not config.meshnav_map_error and path.is_file():
+            return
+        self.navigation_mesh_path = path
+        panel.notice = config.meshnav_map_error or "尚未加载 MeshNav 网格，请在地图管理选择或生成 PLY"
+        if config.meshnav_map_error or path is None or not path.is_file():
+            self.navigation_mesh_preview = None
+            panel.set_mesh(None)
+            panel.update()
+            return
+        self.navigation_mesh_preview = None
+        panel.set_mesh(None)
+        panel.notice = "正在加载 MeshNav 网格…"
+        panel.update()
+        if self.navigation_mesh_worker.busy:
+            return
+
+        def loaded(mesh, error):
+            if path != self.navigation_mesh_path:
+                if self.navigation_mesh_path is not None and self.mesh_mode_button.isChecked():
+                    self._load_navigation_mesh_preview()
+                return
+            self.navigation_mesh_preview = mesh
+            if error:
+                panel.notice = f"网格读取失败：{error}"
+            if getattr(self.node, "_meshnav_surface", None) is None:
+                panel.set_mesh(mesh)
+                panel.update()
+
+        self.navigation_mesh_worker.start(lambda: load_mesh_surface(path), loaded)
 
     def load_navigation_localization_map(self, path: str) -> bool:
         """Use the Localizer PCD as the AR navigation point-cloud map."""
@@ -4852,7 +5476,8 @@ class NavigationWindow(QMainWindow):
             if current_path != source:
                 cloud = load_pointcloud(source)
                 self._set_local_cloud(cloud, reset_original=True)
-            self.set_navigation_map_mode("cloud")
+            if not self.mesh_mode_button.isChecked():
+                self.set_navigation_map_mode("cloud")
             cloud = self.local_cloud
             if cloud is not None:
                 self.map_status.setText(
@@ -5456,8 +6081,30 @@ class NavigationWindow(QMainWindow):
         self._undo_stack.clear()
         self.map_status.setText("已恢复到最近一次加载/保存的地图")
 
-    def on_map_point(self, x: float, y: float) -> None:
-        point = np.array([x, y], dtype=np.float32)
+    def on_map_point(self, x: float, y: float, z: Optional[float] = None) -> None:
+        point = np.array([x, y] if z is None else [x, y, z], dtype=np.float32)
+        if self.navigation_stack_page.navigation_backend.currentData() == "meshnav":
+            try:
+                if not self.node.navigation_route_ready():
+                    raise ValueError("请等待 MeshNav 网格加载及定位就绪")
+                start = self.node.meshnav_start()
+                if start is None:
+                    raise ValueError("当前位置不在 MeshNav 网格覆盖内，请核对定位")
+                point, _ = self.node.meshnav_target(point, start)
+            except ValueError as exc:
+                self.map_panel.set_meshnav_rejected(point if z is None else None)
+                self.node.navigation_status = str(exc)
+                self.nav_status.setText(str(exc))
+                return
+            self.node.walking.body_conflict = None
+            self.map_panel.set_meshnav_rejected(None)
+        elif z is not None:
+            transform = self.node.lookup_matrix(self.node.grid_frame, self.node.map_frame)
+            if transform is None:
+                self.node.navigation_status = "栅格与 MeshNav 网格的坐标变换未就绪"
+                self.nav_status.setText(self.node.navigation_status)
+                return
+            point = apply_transform(point[None, :], transform)[0, :2]
         edit_index = self.waypoint_edit_index
         if edit_index is not None and 0 <= edit_index < len(self.waypoints):
             self.waypoints[edit_index] = point
@@ -5473,6 +6120,9 @@ class NavigationWindow(QMainWindow):
         self._sync_selection_ui(len(self.waypoints) - 1)
 
     def clear_selection(self) -> None:
+        if getattr(self.node, "walking", None) is not None:
+            self.node.walking.body_conflict = None
+        self.map_panel.set_meshnav_rejected(None)
         self.waypoints = []
         self.waypoint_edit_index = None
         self.waypoint_list.setEnabled(True)
@@ -5488,6 +6138,7 @@ class NavigationWindow(QMainWindow):
         self.start_button.setEnabled(bool(self.waypoints) and not editing)
         highlighted = self.waypoint_edit_index if editing else (row if valid else None)
         self.map_panel.set_waypoint_selection(highlighted)
+        self.navigation_mesh_panel.set_waypoint_selection(highlighted)
 
     def begin_waypoint_reselection(self, *_args) -> None:
         if self.waypoint_edit_index is not None:
@@ -5516,6 +6167,8 @@ class NavigationWindow(QMainWindow):
             self.node.navigation_status = "请先在列表中选择要删除的途径点"
             self.nav_status.setText(self.node.navigation_status)
             return
+        if getattr(self.node, "walking", None) is not None:
+            self.node.walking.body_conflict = None
         self.waypoints.pop(row)
         self.waypoint_edit_index = None
         self.waypoint_list.setEnabled(True)
@@ -5530,9 +6183,17 @@ class NavigationWindow(QMainWindow):
             if preferred_index is None else preferred_index)
         self.waypoint_list.blockSignals(True)
         self.waypoint_list.clear()
+        grid_waypoints = []
         for index, point in enumerate(self.waypoints):
-            self.waypoint_list.addItem(
-                f"{index + 1}.   X {point[0]:.2f} m    Y {point[1]:.2f} m")
+            xyz = len(point) == 3
+            label = f"{index + 1}.   X {point[0]:.2f} m    Y {point[1]:.2f} m"
+            self.waypoint_list.addItem(label + (f"    Z {point[2]:.2f} m" if xyz else ""))
+            if xyz and self.node.grid_frame != self.node.map_frame:
+                transform = self.node.lookup_matrix(self.node.grid_frame, self.node.map_frame)
+                if transform is None:
+                    continue
+                point = apply_transform(point[None, :], transform)[0]
+            grid_waypoints.append(point[:2])
         if self.waypoints:
             current_row = int(np.clip(current_row, 0, len(self.waypoints) - 1))
             self.waypoint_list.setCurrentRow(current_row)
@@ -5542,7 +6203,8 @@ class NavigationWindow(QMainWindow):
         self.waypoint_title.setText(
             f"途径点（{len(self.waypoints)}）"
             if self.waypoints else "途径点（尚未添加）")
-        self.map_panel.set_waypoints(self.waypoints)
+        self.map_panel.set_waypoints(grid_waypoints)
+        self.navigation_mesh_panel.set_waypoints(self.waypoints)
         self._on_waypoint_selection_changed(current_row)
 
     def start_navigation(self) -> None:
@@ -5562,7 +6224,16 @@ class NavigationWindow(QMainWindow):
             self.active_page.follow_button.setChecked(True)
             self.pages.setCurrentWidget(self.active_page)
 
+    def _mesh_manual_takeover(self):
+        drive = self.node.mesh_drive
+        if drive is not None and self.node.operating_mode == "robot":
+            drive.stop("正在交还手柄控制", "manual")
+
     def begin_navigation_guidance(self) -> None:
+        drive = getattr(self.node, "mesh_drive", None)
+        if drive is not None and drive.phase == "running":
+            drive.stop("已请求暂停")
+            return
         if not self.node.begin_guidance():
             self.nav_status.setText(self.node.navigation_status)
             return
@@ -5578,13 +6249,17 @@ class NavigationWindow(QMainWindow):
         self._cached_remaining_distance = 0.0
         self._last_route_refresh = 0.0
         self._last_map_navigation_refresh = 0.0
-        for panel in (self.map_panel, self.active_page.map_panel):
+        for panel in (self.map_panel, self.navigation_mesh_panel, self.active_page.map_panel):
             panel.set_navigation_state(None, panel._robot_xy, panel._robot_yaw)
             panel.set_motion_trace(None)
         for panel in (self.camera_panel, self.active_page.camera_panel):
             panel.set_frame(None, None, 0.0)
 
     def exit_navigation(self) -> None:
+        drive = getattr(self.node, "mesh_drive", None)
+        if drive is not None and drive.phase != "idle":
+            drive.stop("退出自动行驶", "exit")
+            return
         if self.pending_navigation_result_status is not None:
             self._finish_navigation_return()
             return
@@ -5603,6 +6278,10 @@ class NavigationWindow(QMainWindow):
         self.last_navigation_result_revision = revision
         self._clear_navigation_overlays()
         if self.pages.currentWidget() is not self.active_page:
+            return
+        walking = getattr(self.node, "walking", None)
+        if walking is not None and walking.phase == "error" and walking.body_conflict is not None:
+            self.pages.setCurrentWidget(self.setup_page)
             return
         status = getattr(self.node, "navigation_result_status", None)
         self.pending_navigation_result_status = status
@@ -5634,8 +6313,17 @@ class NavigationWindow(QMainWindow):
             self.node, "image_revision", id(image) if image is not None else 0))
         if current_page is self.active_page:
             walking = getattr(self.node, "walking", None)
-            self.active_page.set_preview_available(
-                walking is not None and walking.phase == "preview")
+            drive = getattr(self.node, "mesh_drive", None)
+            automatic = drive is not None and self.node.operating_mode == "robot"
+            if drive is not None and not automatic and self.navigation_stack_page.woosh_control_mode:
+                self.navigation_stack_page.set_operating_mode("walking", 0)
+            available = walking is not None and walking.phase == "preview"
+            label = {"idle": "开始自动行驶", "running": "暂停行驶", "paused": "继续自动行驶",
+                     "stopping": "等待底盘停车"}[drive.phase] if automatic else "开始导航"
+            self.active_page.begin_button.setText(label)
+            self.active_page.begin_button.setEnabled(not automatic or drive.phase != "stopping")
+            self.active_page.manual_button.setVisible(automatic and available)
+            self.active_page.set_preview_available(available)
             frame_key = (image_revision, id(getattr(self.node, "path", None)),
                          getattr(self.node, "navigation_active", None))
             if frame_key != self._ar_frame_key or now - self._last_route_refresh >= 1.0 / 15.0:
@@ -5660,6 +6348,11 @@ class NavigationWindow(QMainWindow):
                     if walking is not None and walking.phase in ("planning", "preview", "error")
                     else getattr(self.node, "ar_status", {}).get("message", "")),
             )
+            summary = str(self.node.navigation_status)
+            if self._cached_guidance is not None and self._cached_guidance["live"]:
+                summary = (self._cached_guidance["instruction"]
+                           + f" · 剩余 {self._cached_remaining_distance:.1f} m\n" + summary)
+            self.active_page.navigation_summary.setText(summary)
             if hasattr(self.node, "_image_received_at"):
                 stamp = self.node.image_stamp
                 valid_stamp = stamp is not None and (stamp.sec != 0 or stamp.nanosec != 0)
@@ -5704,6 +6397,52 @@ class NavigationWindow(QMainWindow):
             and now - self._last_map_navigation_refresh >= 1.0 / 15.0
         ):
             path, robot_xy, robot_yaw = self.node.map_navigation_state()
+            mesh_selected = self.navigation_stack_page.navigation_backend.currentData() == "meshnav"
+            surface = getattr(self.node, "_meshnav_surface", None) if mesh_selected else None
+            start = self.node.meshnav_start() if surface is not None and robot_xy is not None else None
+            component = start[1] if start is not None else None
+            display_surface = surface if surface is not None and self.node.grid_frame == self.node.map_frame else None
+            self.map_panel.set_meshnav_overlay(display_surface, component)
+            self.active_page.map_panel.set_meshnav_overlay(display_surface, component)
+            mesh_view = self.navigation_map_views.currentWidget() is self.navigation_mesh_panel
+            if mesh_view:
+                self.navigation_mesh_panel.set_mesh(surface or self.navigation_mesh_preview, component)
+            if display_surface is None:
+                mesh_hint = ("已加载 PLY 预览 · 导航和定位就绪后可选点"
+                             if mesh_view and self.navigation_mesh_preview is not None
+                             else "等待 MeshNav 网格加载")
+            elif start is not None:
+                mesh_hint = ("绿色：与小车连通  ·  黄色：不连通  ·  点击三角面按实际高度选点"
+                             if mesh_view else "绿色：与小车连通  ·  黄色：其他连通区域  ·  多层请切到 Mesh 网格")
+            elif robot_xy is None:
+                mesh_hint = "绿色：网格覆盖  ·  请先完成定位"
+            else:
+                mesh_hint = "绿色：网格覆盖  ·  小车不在覆盖内，请核对定位或地面覆盖"
+            overlay = []
+            if surface is not None and self.node.robot_profile == "woosh":
+                from .features.mesh_follow import BODY_POLYGON, body_outline
+                pose = self.node.lookup_matrix(self.node.map_frame, self.node.base_frame)
+                if pose is not None:
+                    center = start[0] if start is not None else pose[:3, 3]
+                    yaw = math.atan2(pose[1, 0], pose[0, 0])
+                    overlay.extend((("body", body_outline(center, yaw, BODY_POLYGON)),
+                                    ("envelope", body_outline(center, yaw))))
+                conflict = self.node.walking.body_conflict
+                if conflict is not None:
+                    outline, contacts = conflict
+                    if len(outline):
+                        overlay.append(("conflict", outline))
+                    overlay.append(("contacts", contacts))
+                mesh_hint += "  ·  青线车身 / 虚线含 2.5 cm 余量 / 红叉越界"
+            self.navigation_mesh_panel.body_overlay = overlay
+            grid_overlay = overlay
+            if overlay and self.node.map_frame != self.node.grid_frame:
+                tf = self.node.lookup_matrix(self.node.grid_frame, self.node.map_frame)
+                grid_overlay = [] if tf is None else [(k, apply_transform(v, tf)) for k, v in overlay]
+            self.map_panel.body_overlay = self.active_page.map_panel.body_overlay = grid_overlay
+            self.meshnav_hint.setVisible(mesh_selected)
+            if mesh_selected and self.meshnav_hint.text() != mesh_hint:
+                self.meshnav_hint.setText(mesh_hint)
             preview = (getattr(getattr(self.node, "walking", None), "phase", "idle") == "preview"
                        and bool(self.waypoints))
             display_navigation = self._navigation_overlay_enabled and (
@@ -5722,6 +6461,10 @@ class NavigationWindow(QMainWindow):
                 np.asarray(self._motion_trace, dtype=np.float32)
                 if len(self._motion_trace) >= 2 else None)
             self.map_panel.set_navigation_state(path, robot_xy, robot_yaw)
+            if mesh_view:
+                path_xyz = self.node.path_in_frame(self.node.map_frame) if display_navigation else None
+                self.navigation_mesh_panel.set_navigation_state(
+                    path_xyz, start[0] if start is not None else None, robot_yaw)
             self.active_page.map_panel.set_navigation_state(
                 path, robot_xy, robot_yaw)
             self.map_panel.set_motion_trace(trace)
@@ -5762,10 +6505,10 @@ class NavigationWindow(QMainWindow):
             self.show_recordings()
             event.ignore()
             return
-        self.manual_drive_page.shutdown()
-        operations.shutdown()
         self.refresh_timer.stop()
         self.navigation_stack_controller.shutdown()
+        self.manual_drive_page.shutdown()
+        operations.shutdown()
         self.localization_tools_controller.shutdown()
         self.sensor_driver_controller.shutdown()
         self.mapping_controller.shutdown()

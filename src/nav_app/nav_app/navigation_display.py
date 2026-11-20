@@ -6,13 +6,13 @@ import numpy as np
 
 def route_guidance(points, position, yaw, progress=0.):
     """Use local route progress and robot heading; never command robot motion."""
-    xy = np.asarray(points, float)[:, :2]
-    position = np.asarray(position, float)[:2]
-    delta = np.diff(xy, axis=0)
+    position = np.asarray(position, float)
+    route = np.asarray(points, float)[:, :len(position)]
+    delta = np.diff(route, axis=0)
     lengths = np.linalg.norm(delta, axis=1)
     distances = np.r_[0., np.cumsum(lengths)]
-    fraction = np.clip(np.sum((position-xy[:-1])*delta, axis=1) / np.maximum(lengths**2, 1e-8), 0., 1.)
-    projected = xy[:-1] + fraction[:, None]*delta
+    fraction = np.clip(np.sum((position-route[:-1])*delta, axis=1) / np.maximum(lengths**2, 1e-8), 0., 1.)
+    projected = route[:-1] + fraction[:, None]*delta
     along = distances[:-1] + fraction*lengths
     lateral = np.linalg.norm(projected-position, axis=1)
     eligible = (along >= progress-.75) & (along <= progress+3.)
@@ -25,26 +25,26 @@ def route_guidance(points, position, yaw, progress=0.):
     remaining = max(0., float(distances[-1])-progress)
 
     def at(distance):
-        return np.array([np.interp(distance, distances, xy[:, axis]) for axis in (0, 1)])
+        return np.array([np.interp(distance, distances, route[:, axis]) for axis in (0, 1)])
 
-    target = at(min(float(distances[-1]), progress+1.5)) - position
+    target = at(min(float(distances[-1]), progress+1.5)) - position[:2]
     angle = math.atan2(math.sin(math.atan2(target[1], target[0])-yaw),
                        math.cos(math.atan2(target[1], target[0])-yaw))
     direction = ('请转身' if abs(angle)>2.2 else '向左转' if angle>.6 else
                  '向右转' if angle<-.6 else '沿路线前行')
     display_angle = angle
-    if remaining < .8 and np.linalg.norm(position-xy[-1]) < .8:
+    if remaining < .8 and np.linalg.norm(position-route[-1]) < .8:
         direction = '接近目的地'
         display_angle = 0.
     elif abs(angle) <= .6:
         # Three-metre before/after chords suppress tiny planner-segment bends.
         upcoming = None
-        for i in range(1, len(xy)-1):
+        for i in range(1, len(route)-1):
             distance = distances[i]-progress
             if not 1. <= distance <= 20.:
                 continue
-            before = xy[i]-at(max(0., distances[i]-3.))
-            after = at(min(float(distances[-1]), distances[i]+3.))-xy[i]
+            before = route[i, :2]-at(max(0., distances[i]-3.))
+            after = at(min(float(distances[-1]), distances[i]+3.))-route[i, :2]
             if min(np.linalg.norm(before), np.linalg.norm(after)) < .5:
                 continue
             turn = math.atan2(np.cross(before, after), np.dot(before, after))
@@ -125,6 +125,10 @@ def guidance_state(node):
     if node.path_frame == node.base_frame and time.monotonic()-node._path_received_at > .5:
         return waiting('等待最新局部路线')
     yaw = math.atan2(matrix[1, 0], matrix[0, 0])
-    cue = route_guidance(node.path, matrix[:2, 3], yaw, node._guidance_progress)
+    position = matrix[:2, 3]
+    if getattr(node, "_meshnav_active", False):
+        ground = node.lookup_matrix(node.path_frame, node.ground_frame, stamp)
+        position = (matrix if ground is None else ground)[:3, 3]
+    cue = route_guidance(node.path, position, yaw, node._guidance_progress)
     node._guidance_progress = cue['progress']
     return cue

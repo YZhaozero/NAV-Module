@@ -162,7 +162,7 @@ class ManualDrive:
 
 
 class WooshTeleopRos:
-    """Lazy vendor bindings: connecting only polls status and subscribes to Joy."""
+    """WOOSH SDK bindings for status queries and velocity requests."""
     def __init__(self, node, namespace="/woosh_robot", clock=time.monotonic):
         from woosh_robot_msgs.srv import Twist, Mode, DeviceState, PoseSpeed
         from woosh_robot_msgs.msg import DeviceStateHardwareBit
@@ -185,7 +185,7 @@ class WooshTeleopRos:
                     if name == "PoseSpeed" and (not value.has_field & value.TWIST_FIELD_SET or
                             not all(math.isfinite(v) for v in (value.twist.linear, value.twist.angular))):
                         raise ValueError("速度反馈缺失或无效")
-                    self.samples[name] = (now, value)
+                    self.samples[name] = (started, value)
                     self.errors.pop(name, None)
                 except (RuntimeError, ValueError) as error:
                     self.errors[name] = str(error)
@@ -199,7 +199,7 @@ class WooshTeleopRos:
                 if name not in self.reads and self.clients[name].service_is_ready():
                     self.reads[name] = (self.clients[name].call_async(self.types[name].Request()), now)
 
-    def health(self, now):
+    def health(self, now, *, max_age=1.):
         reason = ""
         if not self.clients["Twist"].service_is_ready():
             reason = "等待 /woosh_robot/robot/Twist 服务"
@@ -207,7 +207,7 @@ class WooshTeleopRos:
             reason = next(iter(self.errors.values()))
         else:
             for name in ("Mode", "DeviceState", "PoseSpeed"):
-                if name not in self.samples or not 0 <= now-self.samples[name][0] <= 1.:
+                if name not in self.samples or not 0 <= now-self.samples[name][0] <= max_age:
                     reason = "等待有效状态反馈："+name
                     break
         if reason:

@@ -21,6 +21,9 @@ class Scene:
     viewer_url: str = ""
     error: str = ""
     gravity_aligned: bool = False
+    meshnav: str = ""
+    meshnav_error: str = ""
+    previous_meshnav: str = ""
 
     @property
     def file_time(self):
@@ -73,7 +76,8 @@ class Scene:
             "SC ✓" if self.global_ready else
             "SC 待核对" if self.scan_context and Path(self.scan_context).is_file()
             else "SC 未生成")
-        return f"{cloud} · {grid} · {scan_context}"
+        mesh = "MeshNav ✓" if self.meshnav and not self.meshnav_error else "MeshNav 待生成"
+        return f"{cloud} · {grid} · {scan_context} · {mesh}"
 
 
 def normalize_scene_title(value):
@@ -166,6 +170,18 @@ def read_scene(path):
         viewer_url=str(data.get("viewer_url", "")),
         gravity_aligned=data.get('generated', {}).get('gravity_aligned') is True,
     )
+    mesh = data.get("meshnav")
+    if mesh is not None:
+        try:
+            scene.meshnav = str((path.parent / (mesh.get("physical_v2") or mesh["file"])).resolve())
+            if mesh.get("physical_v2"):
+                scene.previous_meshnav = str((path.parent / mesh["file"]).resolve())
+            source = Path(cloud).stat()
+            if (Path(scene.meshnav).suffix.lower() != ".ply" or not Path(scene.meshnav).is_file()
+                    or source.st_size != mesh["pcd_size"] or source.st_mtime_ns != mesh["pcd_mtime_ns"]):
+                scene.meshnav_error = "MeshNav 网格已失效，请在地图管理重新生成"
+        except (OSError, KeyError, TypeError):
+            scene.meshnav_error = "MeshNav 网格关联无效，请在地图管理重新生成"
     if scene.grid and Path(scene.grid).suffix.lower() not in (".yaml", ".yml"):
         scene.error = "通行地图格式不支持"
     if scene.cloud and Path(scene.cloud).suffix.lower() != ".pcd":

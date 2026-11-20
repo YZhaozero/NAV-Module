@@ -338,13 +338,16 @@ def load_pcd(path: str | Path, max_points: Optional[int] = None) -> PointCloudMa
         points=points, path=path, colors=colors, color_source=color_source, source_point_count=point_count)
 
 
-def _read_ply_header(stream):
+def _read_ply_header(stream, *, mesh=False):
     first = stream.readline().decode("ascii", errors="strict").strip().lower()
     if first != "ply":
         raise ValueError("PLY 文件缺少 ply 文件头")
     encoding = None
     vertex_count = None
     vertex_properties = []
+    face_properties = []
+    elements = []
+    face_count = 0
     current_element = None
     while True:
         line = stream.readline()
@@ -362,6 +365,10 @@ def _read_ply_header(stream):
             if len(parts) != 3:
                 raise ValueError("PLY element 文件头格式错误")
             current_element = parts[1].lower()
+            if mesh:
+                elements.append(current_element)
+                if current_element == "face":
+                    face_count = int(parts[2])
             if current_element == "vertex":
                 vertex_count = int(parts[2])
         elif key == "property" and current_element == "vertex":
@@ -373,6 +380,8 @@ def _read_ply_header(stream):
             if kind not in _PLY_TYPES:
                 raise ValueError(f"不支持的 PLY 属性类型: {kind}")
             vertex_properties.append((name, kind))
+        elif mesh and key == "property" and current_element == "face":
+            face_properties.append(tuple(part.lower() for part in parts[1:]))
         elif key == "end_header":
             break
     if encoding not in ("ascii", "binary_little_endian", "binary_big_endian"):
@@ -381,6 +390,10 @@ def _read_ply_header(stream):
         raise ValueError("PLY 文件没有有效的 vertex 元素")
     if not vertex_properties:
         raise ValueError("PLY 文件没有 vertex 属性")
+    if mesh:
+        if elements[:2] != ["vertex", "face"] or face_count <= 0:
+            raise ValueError("MeshNav PLY 需要三角面，且顶点必须在面数据之前")
+        return encoding, vertex_count, vertex_properties, face_count, face_properties
     return encoding, vertex_count, vertex_properties
 
 
@@ -517,6 +530,54 @@ def load_ply(path: str | Path, *, preview_points: int | None = None) -> PointClo
         splat_opacities=splat_opacities,
         source_point_count=vertex_count,
     )
+
+
+def load_ply_triangles(path: str | Path):
+    """Read a PLY 1.0 mesh, keeping the original vertex indices and XYZ."""
+    with Path(path).expanduser().open("rb") as stream:
+        encoding, vertices_count, properties, face_count, face_properties = _read_ply_header(stream, mesh=True)
+        vertex_names = [name for name, _ in properties]
+        if not {"x", "y", "z"}.issubset(vertex_names):
+            raise ValueError("网格顶点需要 x、y、z 属性")
+        endian = ">" if encoding == "binary_big_endian" else "<"
+        face_fields = []
+        list_offset = None
+        for prop in face_properties:
+            if len(prop) == 4 and prop[0] == "list" and prop[3] in ("vertex_indices", "vertex_index"):
+                count_type, index_type = (_PLY_TYPES.get(value, "") for value in prop[1:3])
+                if list_offset is not None or count_type[:1] not in ("i", "u") or index_type[:1] not in ("i", "u"):
+                    raise ValueError("PLY 三角面索引格式无效")
+                list_offset = len(face_fields)
+                face_fields.extend([("count", endian + count_type), ("indices", endian + index_type, (3,))])
+            elif len(prop) == 2 and prop[0] in _PLY_TYPES:
+                face_fields.append((f"scalar_{len(face_fields)}", endian + _PLY_TYPES[prop[0]]))
+            else:
+                raise ValueError("PLY 面属性格式不支持")
+        if list_offset is None:
+            raise ValueError("PLY 缺少三角面顶点索引")
+        if encoding == "ascii":
+            records = np.loadtxt(stream, dtype=float, ndmin=2, max_rows=vertices_count)
+            faces = np.loadtxt(stream, dtype=float, ndmin=2, max_rows=face_count)
+            if records.shape != (vertices_count, len(properties)) or faces.shape != (face_count, len(face_fields) + 2):
+                raise ValueError("PLY 顶点或三角面数据长度错误")
+            vertices = records[:, [vertex_names.index(axis) for axis in "xyz"]]
+            counts, indices = faces[:, list_offset], faces[:, list_offset+1:list_offset+4]
+            if not np.equal(indices, np.floor(indices)).all():
+                raise ValueError("PLY 三角面顶点索引必须为整数")
+        else:
+            vertex_dtype = np.dtype([(name, endian + _PLY_TYPES[kind]) for name, kind in properties])
+            records = np.fromfile(stream, dtype=vertex_dtype, count=vertices_count)
+            face_dtype = np.dtype(face_fields)
+            faces = np.fromfile(stream, dtype=face_dtype, count=face_count)
+            if len(records) != vertices_count or len(faces) != face_count:
+                raise ValueError("PLY 顶点或三角面数据长度错误")
+            vertices = np.column_stack([records[axis] for axis in "xyz"])
+            counts, indices = faces["count"], faces["indices"]
+    if np.any(counts != 3):
+        raise ValueError("请先将 PLY 面转换成三角面")
+    if not np.isfinite(vertices).all() or indices.min() < 0 or indices.max() >= vertices_count:
+        raise ValueError("PLY 网格含有无效顶点或索引")
+    return vertices, indices.astype(np.int64)
 
 
 def load_pointcloud(path: str | Path, max_points: Optional[int] = None) -> PointCloudMap:
@@ -748,7 +809,7 @@ def save_grid_map(path: str | Path, grid: GridMap) -> Tuple[Path, Path]:
 
 
 def pointcloud2_to_pointcloud(
-    message, max_points: int = 400_000,
+    message, max_points: int = 400_000, *, include_colors: bool = True,
 ) -> PointCloudMap:
     """Extract XYZ and source colors from PointCloud2 without sensor_msgs_py."""
     fields = {field.name: field for field in message.fields}
@@ -761,14 +822,15 @@ def pointcloud2_to_pointcloud(
     byte_order = ">" if bool(getattr(message, "is_bigendian", False)) else "<"
     names, formats, offsets = [], [], []
     selected = ["x", "y", "z"]
-    if "rgba" in fields:
-        selected.append("rgba")
-    elif "rgb" in fields:
-        selected.append("rgb")
-    elif all(axis in fields for axis in ("r", "g", "b")):
-        selected.extend(("r", "g", "b"))
-    elif "intensity" in fields:
-        selected.append("intensity")
+    if include_colors:
+        if "rgba" in fields:
+            selected.append("rgba")
+        elif "rgb" in fields:
+            selected.append("rgb")
+        elif all(axis in fields for axis in ("r", "g", "b")):
+            selected.extend(("r", "g", "b"))
+        elif "intensity" in fields:
+            selected.append("intensity")
     for name in selected:
         field = fields[name]
         if field.datatype not in datatype_map:
@@ -784,7 +846,13 @@ def pointcloud2_to_pointcloud(
         "itemsize": int(message.point_step),
     })
     count = int(message.width) * int(message.height)
-    records = np.frombuffer(message.data, dtype=dtype, count=count)
+    width, height = int(message.width), int(message.height)
+    packed = width * dtype.itemsize
+    stride = int(getattr(message, "row_step", packed))
+    if stride < packed or len(message.data) < stride * height:
+        raise ValueError("PointCloud2 行长度或数据长度不完整")
+    records = np.ndarray((height, width), dtype=dtype, buffer=message.data,
+                         strides=(stride, dtype.itemsize)).reshape(-1)
     if count > max_points:
         records = records[::max(1, int(math.ceil(count / max_points)))]
     columns = {name: records[name] for name in selected}
@@ -807,4 +875,4 @@ def pointcloud2_to_pointcloud(
 
 def pointcloud2_to_xyz(message, max_points: int = 400_000) -> np.ndarray:
     """Backward-compatible XYZ-only PointCloud2 conversion."""
-    return pointcloud2_to_pointcloud(message, max_points=max_points).points
+    return pointcloud2_to_pointcloud(message, max_points=max_points, include_colors=False).points

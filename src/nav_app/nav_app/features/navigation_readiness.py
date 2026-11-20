@@ -91,7 +91,7 @@ class NavigationReadiness:
                 return bool(action_ready and (self.mode != 'robot' or robot_action_ready))
             now = self.clock()
             required = ['planner_server']
-            if self.backend == 'walking':required += ['map_server']
+            if self.backend == 'walking' or self.mode == 'robot':required += ['map_server']
             if self.mode == 'robot':required += ['bt_navigator', 'controller_server']
             states = {name:self._state(name, now) for name in required}
             if self.backend == 'walking' and self.mode != 'robot':

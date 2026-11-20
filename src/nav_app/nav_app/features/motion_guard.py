@@ -14,7 +14,7 @@ class MotionGuard:
         self.clock=clock;self.max_speed=min(max_speed,.5);self.max_yaw=min(max_yaw,1.)
         self.acceleration=min(acceleration,1.);self.timeout=timeout
         self.armed=False;self.reason='disarmed';self.permit_time=None;self.command_time=None;self.feedback_time=None
-        self.command=(0.,0.,0.);self.measured=None;self.sequence=0;self.ack=0;self.sent=(0.,0.,0.)
+        self.command=(0.,0.,0.);self.measured=None;self.stop_pending=False;self.sequence=0;self.ack=0;self.sent=(0.,0.,0.)
         self.last_tick=clock();self.healthy=False;self.connected=False;self.estop_released=False
 
     def disarm(self,reason='disarmed'):
@@ -28,19 +28,30 @@ class MotionGuard:
         self.healthy=bool(valid)
         if not self.healthy:self.disarm('localization_unavailable')
 
-    def feedback(self,connected,estop_released,ack,velocity):
-        if (type(ack)!=int or not 0<=ack<=self.sequence or len(velocity)!=3
+    def feedback(self,connected,estop_released,ack,velocity,stop_pending=False):
+        if (type(ack)!=int or not 0<=ack<=self.sequence or not isinstance(velocity,(list,tuple)) or len(velocity)!=3
                 or not all(type(x) in (int,float) and math.isfinite(x) for x in velocity)):
             self.disarm('invalid_base_feedback');self.feedback_time=None;return
         self.feedback_time=self.clock();self.connected=connected is True;self.estop_released=estop_released is True
-        self.ack=ack;self.measured=tuple(velocity)
+        self.ack=ack;self.measured=tuple(velocity);self.stop_pending=stop_pending
         if not self.connected or not self.estop_released:self.disarm('base_unavailable')
 
+    def unready_reason(self):
+        now = self.clock()
+        if not self.healthy:
+            return "localization_unavailable"
+        if self.feedback_time is None or not 0 <= now - self.feedback_time <= self.timeout:
+            return "base_feedback_timeout"
+        if not self.connected or not self.estop_released:
+            return "base_unavailable"
+        if self.sequence - self.ack > 6:
+            return "base_ack_lag"
+        if self.permit_time is None or not 0 <= now - self.permit_time <= self.timeout:
+            return "permit_timeout"
+        return ""
+
     def ready(self):
-        now=self.clock()
-        return (self.healthy and self.connected and self.estop_released and self.feedback_time is not None
-                and 0<=now-self.feedback_time<=self.timeout and self.sequence-self.ack<=6
-                and self.permit_time is not None and 0<=now-self.permit_time<=self.timeout)
+        return not self.unready_reason()
 
     def arm(self):
         if not self.ready():self.disarm('fresh_permit_localization_and_base_feedback_required');return False
@@ -54,7 +65,10 @@ class MotionGuard:
     def tick(self):
         now=self.clock();dt=now-self.last_tick;self.last_tick=now
         if dt<0 or dt>self.timeout:self.disarm('control_clock_or_scheduler_gap')
-        if self.armed and not self.ready():self.disarm('permit_localization_or_base_timeout')
+        if self.armed:
+            reason = self.unready_reason()
+            if reason:
+                self.disarm(reason)
         if self.armed and self.command_time is not None and not 0<=now-self.command_time<=self.timeout:self.disarm('command_timeout')
         target=(0.,0.,0.)
         if self.armed and self.command_time is not None:
@@ -66,8 +80,11 @@ class MotionGuard:
             speed=math.hypot(*target[:2])
             if speed>self.max_speed:target=(target[0]*self.max_speed/speed,target[1]*self.max_speed/speed,target[2])
         self.sent=target;self.sequence+=1
-        stopped=bool(self.connected and self.feedback_time is not None and 0<=now-self.feedback_time<=self.timeout
+        stopped=bool(self.connected and not self.stop_pending and self.feedback_time is not None and 0<=now-self.feedback_time<=self.timeout
                      and self.measured is not None and math.hypot(*self.measured[:2])<.02 and abs(self.measured[2])<.03)
         return dict(schema=1,sequence=self.sequence,velocity=list(target),armed=self.armed,reason=self.reason,
-                    stop_confirmed=stopped and not self.armed,base_connected=bool(self.connected and self.feedback_time is not None
+                    stop_confirmed=stopped and not self.armed,
+                    ready_to_start=stopped and not self.armed and self.estop_released and self.healthy,
+                    measured_velocity=self.measured,
+                    base_connected=bool(self.connected and self.feedback_time is not None
                         and 0<=now-self.feedback_time<=self.timeout))

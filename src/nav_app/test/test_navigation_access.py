@@ -38,6 +38,7 @@ def window(tmp_path, monkeypatch, application):
 def test_saved_preset_controls_owned_launches_and_keeps_nav2(window, tmp_path, preset, owned):
     page = window.navigation_access_page
     page.load_preset(preset)
+    page.fields["navigation_engine"].setCurrentIndex(page.fields["navigation_engine"].findData("nav2"))
     page.save()
     grid, _ = save_grid_map(tmp_path / "room.yaml", GridMap(np.zeros((10,10),dtype=np.int8), .05, np.zeros(3)))
     cloud = tmp_path / "room.pcd";cloud.write_text("PCD")
@@ -396,3 +397,38 @@ def test_native5_replay_and_external_mode_do_not_acquire_hardware(source, simula
         lidar_driver_mode=mode, camera_driver_mode="external", odometry_backend="fast_livo",
         sensor_source=source, use_sim_time=simulated)
     assert "lidar" not in build_navigation_launches(config)
+
+
+def test_woosh_defaults_to_meshnav_and_launches_without_scan(window, tmp_path, monkeypatch):
+    from ament_index_python import packages
+
+    real_share = packages.get_package_share_directory
+    monkeypatch.setattr(packages, "get_package_prefix", lambda name: str(tmp_path))
+    page = window.navigation_access_page
+    page.load_preset("woosh_native5")
+    stack = window.navigation_stack_page
+    cloud = tmp_path / "office.pcd"
+    cloud.write_text("PCD")
+    mesh = cloud.with_suffix(".mesh.ply")
+    mesh.write_text("ply")
+    monkeypatch.setattr(packages, "get_package_share_directory", lambda name: str(tmp_path) if name == "nav_app" else real_share(name))
+    stack.localization_map.setText(str(cloud))
+    stack.scan_context_map.clear()
+    page.save()
+    config = stack.configuration()
+
+    assert page.settings.value("profiles/woosh")["navigation_engine"] == "meshnav"
+    assert config.navigation_backend == "meshnav" and config.woosh_control_mode == 0
+    assert validate_navigation_stack(config)[0]
+    launches = build_navigation_launches(config)
+    assert "laserscan" not in launches
+    assert launches["nav2"][:3] == ["run", "mbf_mesh_nav", "mbf_mesh_nav"]
+    assert f"mesh_map.mesh_file:={mesh}" in launches["nav2"]
+    stack.set_operating_mode("robot", 1)
+    auto = stack.configuration()
+    assert auto.navigation_backend == "meshnav" and validate_navigation_stack(auto)[0]
+    auto_launch = build_navigation_launches(auto)
+    assert "laserscan" not in auto_launch
+    assert auto.mesh_cloud_topic == "/nav/livox5/points_filtered"
+    assert auto_launch["nav2"][:3] == ["launch", "nav_app", "woosh_mesh_drive.launch.py"]
+    assert f"mesh:={mesh}" in auto_launch["nav2"] and "control_mode:=1" in auto_launch["nav2"]

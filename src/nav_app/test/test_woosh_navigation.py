@@ -94,6 +94,7 @@ def test_navigation_health_follows_selected_bridge_lidar_and_keeps_stale_detecti
     subscriptions, destroyed = [], []
     old_subscription = object()
     node = SimpleNamespace(
+        mesh_drive=None, _meshnav_active=False,
         _navigation_lidar_topic="/livox/lidar/pointcloud",
         _navigation_lidar_subscription=old_subscription,
         _last_lidar_message_time=0., _last_camera_message_time=0.,

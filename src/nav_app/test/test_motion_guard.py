@@ -28,6 +28,8 @@ def test_dropped_command_or_feedback_latches_stop_until_rearmed():
             if drop!='command':g.velocity((.2,0.,0.))
             g.localization(drop!='localization');state=g.tick()
         assert not state['armed'] and state['velocity']==[0.,0.,0.]
+        assert state['reason'] == {'command': 'command_timeout', 'feedback': 'base_feedback_timeout',
+                                   'permit': 'permit_timeout', 'localization': 'localization_unavailable'}[drop]
         ready(g);g.velocity((.2,0.,0.));assert not g.tick()['armed']
         assert g.arm()
 

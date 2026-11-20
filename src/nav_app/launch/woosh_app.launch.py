@@ -19,6 +19,8 @@ def _start_camera_receiver(context):
 def generate_launch_description():
     share = get_package_share_directory("nav_app")
     return LaunchDescription([
+        DeclareLaunchArgument("operating_mode", default_value="walking", choices=["walking", "robot"]),
+        DeclareLaunchArgument("woosh_control_mode", default_value="0", choices=["0", "1", "2"]),
         DeclareLaunchArgument("fullscreen", default_value="false"),
         DeclareLaunchArgument("phone_remote_enabled", default_value="false"),
         OpaqueFunction(function=_start_camera_receiver),
@@ -35,7 +37,9 @@ def generate_launch_description():
                  "camera_height_m": 0.215,
                  "mapping_backend": "woosh_native5",
                  "robot_profile": "woosh",
-                 "operating_mode": "walking",
+                 "operating_mode": LaunchConfiguration("operating_mode"),
+                 "woosh_control_mode": ParameterValue(
+                     LaunchConfiguration("woosh_control_mode"), value_type=int),
                  "pointcloud_map_path": "",
                  "map_storage_dir": os.environ.get("NAV_MAP_DIR", os.path.expanduser("~/nav_maps")),
                  "pointcloud_topic": "",

@@ -122,7 +122,8 @@ def test_existing_ui_exposes_fast_livo_without_enabling_uncalibrated_vision():
 def test_navigation_stack_stop_clears_localizer_requirement():
     node = SimpleNamespace(
         require_localizer_quality=True, _navigation_input_subscriptions=[],
-        _navigation_health_subscription=None,
+        _navigation_health_subscription=None, _woosh_motion_enabled=False, mesh_drive=None,
+        _meshnav_active=False,
         _navigation_readiness=SimpleNamespace(reset=lambda: None))
     QtNavRosNode.configure_navigation(node, None)
     assert node.require_localizer_quality is False

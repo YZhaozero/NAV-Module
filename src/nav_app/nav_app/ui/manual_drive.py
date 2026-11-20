@@ -207,6 +207,7 @@ class ManualDrivePage(QWidget):
         if not self.connect_agent():return
         if self.agent_process.active or self.policy.transport.clients["Twist"].service_is_ready():
             self.policy.message="Agent 已运行，使用现有连接";return
+        self.policy.message="正在启动 WOOSH Agent，等待底盘状态"
         self.agent_process.start_launch(["run","woosh_robot_agent","agent","--ros-args",
             "-r","__ns:=/woosh_robot","-p","ip:="+address])
 
@@ -252,6 +253,7 @@ class ManualDrivePage(QWidget):
         for widget in (self.chassis,self.linear,self.angular,self.connect_button,self.start_agent_button):
             widget.setEnabled(not self.policy.armed)
         self.horizontal.setEnabled(self.policy.chassis=="omni" and not self.policy.armed)
+        self.stop_button.setEnabled(not self.busy())
         vx,vy,w=self.policy.last_command
         self.requested.setText(f"请求：X {vx:+.2f} · Y {vy:+.2f} m/s · 转动 {w:+.2f} rad/s")
         measured=health["measured"]

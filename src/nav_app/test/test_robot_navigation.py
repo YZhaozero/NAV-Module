@@ -105,6 +105,8 @@ def test_robot_goal_is_only_sent_after_explicit_preview_confirmation():
         send_navigation_waypoints = QtNavRosNode.send_navigation_waypoints
         begin_guidance = QtNavRosNode.begin_guidance
         grid_frame='map'
+        _meshnav_active=False
+        robot_profile=''
         operating_mode='walking'
         def navigation_route_ready(self):return True
         def walking_pose(self): return np.array([0., 0.]), 0.

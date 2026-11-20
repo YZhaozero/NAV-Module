@@ -14,6 +14,11 @@ def start(context):
     value = lambda name: context.launch_configurations[name]
     simulated = value("use_sim_time").lower() == "true"
     autostart = value("autostart").lower() == "true"
+    base_control = value("enable_base_control").lower() == "true"
+    control_mode = int(value("required_control_mode"))
+    if base_control and (simulated or control_mode not in (1, 2)
+                         or value("external_localization").lower() != "true"):
+        raise ValueError("WOOSH execution requires live time, external localization and a confirmed control mode")
     share = Path(get_package_share_directory("nav_app"))
     parameters = yaml.safe_load(Path(value("nav2_params_file")).read_text())
     overrides = yaml.safe_load((share / "config/woosh_nav2.yaml").read_text())
@@ -66,9 +71,9 @@ def start(context):
                           "node_names": [name for pkg, name, remaps in specs]}]),
         Node(package="nav_app", executable="motion_guard", name="nav_motion_guard", output="screen"),
     ]
-    if value("enable_base_control").lower() == "true":
+    if base_control:
         nodes.append(Node(package="nav_app", executable="woosh_base_adapter", output="screen",
-                          parameters=[{"required_control_mode": int(value("required_control_mode"))}]))
+                          parameters=[{"required_control_mode": control_mode}]))
     else:
         nodes.append(LogInfo(msg="WOOSH：仅定位与规划，底盘执行未启用；速度输出为 /nav/planner_cmd_vel"))
     if value("rviz").lower() == "true":

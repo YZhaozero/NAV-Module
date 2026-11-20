@@ -10,6 +10,7 @@ from .touch_scroll import enable_touch_scroll
 class SystemHomePage(QWidget):
     mapping_requested = pyqtSignal()
     navigation_requested = pyqtSignal()
+    navigation_mode_requested = pyqtSignal()
     maps_requested = pyqtSignal()
     settings_requested = pyqtSignal()
     phone_requested = pyqtSignal()
@@ -19,7 +20,7 @@ class SystemHomePage(QWidget):
     map_tasks_requested = pyqtSignal()
     mapping_settings_requested = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self, *, woosh=False):
         super().__init__()
         self.setObjectName("systemHome")
         layout = QVBoxLayout(self)
@@ -34,6 +35,12 @@ class SystemHomePage(QWidget):
         self.state.setObjectName("homeState")
         self.state.setAlignment(Qt.AlignRight)
         actions.addWidget(self.state)
+        self.battery = QLabel("底盘电量 -- · 等待底盘电量")
+        self.battery.setObjectName("homeBattery")
+        self.battery.setAlignment(Qt.AlignRight)
+        self.battery.setWordWrap(True)
+        self.battery.setVisible(woosh)
+        actions.addWidget(self.battery)
         quick = QHBoxLayout()
         self.phone_button = QPushButton("手机遥控")
         self.phone_button.setObjectName("workspaceButton")
@@ -94,7 +101,14 @@ class SystemHomePage(QWidget):
         self.navigation_button = QPushButton("进入导航")
         self.navigation_button.setObjectName("homeNavigation")
         self.navigation_button.clicked.connect(self.navigation_requested.emit)
-        layout.addWidget(self.navigation_button)
+        navigation_row = QHBoxLayout()
+        navigation_row.addWidget(self.navigation_button, 2)
+        self.navigation_mode_button = QPushButton("导航模式")
+        self.navigation_mode_button.setObjectName("homeNavigation")
+        self.navigation_mode_button.setVisible(woosh)
+        self.navigation_mode_button.clicked.connect(self.navigation_mode_requested.emit)
+        navigation_row.addWidget(self.navigation_mode_button, 1)
+        layout.addLayout(navigation_row)
         bottom = QHBoxLayout()
         self.maps_button = QPushButton("地图管理")
         self.maps_button.setObjectName("homeTile")
@@ -112,7 +126,8 @@ class SystemHomePage(QWidget):
         self.layout().setSpacing(5 if compact else 10)
         self.prompt.setVisible(not compact)
         self.mapping_button.setMinimumHeight(60 if compact else 82)
-        self.navigation_button.setMinimumHeight(44 if compact else 56)
+        for button in (self.navigation_button, self.navigation_mode_button):
+            button.setMinimumHeight(44 if compact else 56)
         for button in (self.maps_button, self.settings_button):
             button.setMinimumHeight(48 if compact else 62)
         self.setStyleSheet("""

@@ -77,17 +77,20 @@ class NavigationStackPage(QWidget):
         localization_tools: LocalizationToolsController,
         robot_profile: str = "",
         operating_mode: str = "robot",
+        woosh_control_mode: int = 0,
     ) -> None:
         super().__init__()
         self.controller = controller
         self.robot_profile = robot_profile
         self.operating_mode = operating_mode
+        self.woosh_control_mode = woosh_control_mode if operating_mode == "robot" else 0
         self.map_storage_dir = Path(map_storage_dir)
         self.lidar_arguments = lidar_arguments
         self.camera_arguments = camera_arguments
         self.localization_tools = localization_tools
         self.component_status = {}
         self.access_settings = {}
+        self.meshnav_scene = None
         self._build_ui()
         if operating_mode == "walking":
             self.navigation_backend.setCurrentIndex(self.navigation_backend.findData("walking"))
@@ -491,6 +494,8 @@ class NavigationStackPage(QWidget):
             self._scrollable(self._build_scan_planner_panel()))
         self.navigation_backend_stack.addWidget(
             self._build_custom_navigation_panel())
+        self.navigation_backend_stack.addWidget(QLabel(
+            "在「导航接入设置」选择 PLY 网格。该网格需与定位地图使用同一坐标系。"))
         layout.addWidget(self.navigation_backend_stack, 1)
         self.navigation_backend.currentIndexChanged.connect(
             self._update_navigation_backend)
@@ -702,7 +707,7 @@ class NavigationStackPage(QWidget):
         key = self.navigation_backend.itemData(index)
         self.nav2_params.setPlaceholderText("留空使用仅规划参数" if key == "walking" else "留空使用 nav2_bringup 默认参数")
         self.nav2_rviz.setEnabled(key != "walking")
-        self.navigation_backend_stack.setCurrentIndex({"nav2": 0, "walking": 0, "scan_planner": 1, "custom": 2}[key])
+        self.navigation_backend_stack.setCurrentIndex({"nav2": 0, "walking": 0, "scan_planner": 1, "custom": 2, "meshnav": 3}[key])
         backend = NAVIGATION_BACKENDS.get(key)
         self.navigation_backend_description.setText(
             backend.description if backend is not None else "")
@@ -749,8 +754,15 @@ class NavigationStackPage(QWidget):
             field.setText(path)
 
     def configuration(self) -> NavigationStackConfig:
+        scene = self.meshnav_scene
+        scene_matches = (scene is not None and scene.cloud == self.localization_map.text().strip()
+                         and scene.grid == self.navigation_map.text().strip())
         return NavigationStackConfig(
             robot_profile=self.robot_profile,
+            woosh_control_mode=self.woosh_control_mode,
+            meshnav_map=(scene.meshnav if scene_matches and scene.meshnav
+                         else self.access_settings.get("meshnav_map", "")),
+            meshnav_map_error=scene.meshnav_error if scene_matches else "",
             lidar_driver_mode=self.access_settings.get("lidar_driver_mode", "profile"),
             camera_driver_mode=self.access_settings.get("camera_driver_mode", "profile"),
             scan_source=self.access_settings.get("scan_source", "profile"),
@@ -844,8 +856,6 @@ class NavigationStackPage(QWidget):
             combo = getattr(self, key)
             combo.setCurrentIndex(combo.findData(values[key]))
             combo.setEnabled(False)
-        self.navigation_backend.setCurrentIndex(self.navigation_backend.findData("walking" if self.operating_mode == "walking" else "nav2"))
-        self.navigation_backend.setEnabled(False)
         for key, field in (("lidar_topic", self.dlio_pointcloud_topic),
                            ("fast_livo_lidar_topic", self.fast_livo_lidar_topic),
                            ("lidar_topic", self.laser_cloud_topic),
@@ -861,13 +871,36 @@ class NavigationStackPage(QWidget):
             camera="相机驱动 · " + {"nav": "NAV 启动", "external": "已有话题", "off": "不使用"}[values["camera_driver_mode"]],
             dlio="里程计 · " + {"external": "已有 Odometry", "fast_livo": "FAST-LIVO2", "dlio": "DLIO"}[values["odometry_backend"]],
             laserscan="避障 scan · " + ("已有 LaserScan" if values["scan_source"] == "external" else "点云转换"),
-            localizer="地图定位 · " + {"amcl": "AMCL", "external": "已有 TF", "pointcloud_localizer": "点云 Localizer"}[values["localization_backend"]],
-            nav2="路线规划 · Nav2" if self.operating_mode == "walking" else "统一导航 · Nav2")
-        for index, key in enumerate(START_ORDER, start=1):
+            localizer="地图定位 · " + {"amcl": "AMCL", "external": "已有 TF", "pointcloud_localizer": "点云 Localizer"}[values["localization_backend"]])
+        for index, key in enumerate(START_ORDER[:-1], start=1):
             self.component_names[key].setText(f"{index}. {names[key]}")
         for key, state in self.controller.states.items():
             self._handle_component_state(key, state)
-        self.action_status.setText("接入设置已应用；仅规划路线，使用手柄控制行走。" if self.operating_mode == "walking" else "接入设置已应用；导航后端统一为 Nav2，底盘执行许可保持原配置。")
+        self.set_operating_mode(self.operating_mode, self.woosh_control_mode)
+
+    def set_operating_mode(self, mode, control_mode):
+        self.operating_mode = mode
+        self.woosh_control_mode = control_mode
+        walking = mode == "walking"
+        mesh = self.access_settings.get("navigation_engine") == "meshnav"
+        self.navigation_backend.setCurrentIndex(self.navigation_backend.findData(
+            "meshnav" if mesh else "walking" if walking else "nav2"))
+        self.navigation_backend.setEnabled(False)
+        label = "路线规划 · MeshNav" if mesh else "路线规划 · Nav2" if walking else "统一导航 · Nav2"
+        self.component_names["nav2"].setText(f"{len(START_ORDER)}. {label}")
+        if mesh and self.woosh_control_mode:
+            status = "MeshNav 自动行驶；确认三维路线后点击“开始自动行驶”。"
+            self.component_names["laserscan"].setText("4. 自动行驶避障 · 实时三维点云")
+        elif mesh:
+            status = "MeshNav 三维规划；使用手柄控制行走。"
+            self.component_names["laserscan"].setText("4. 避障 LaserScan · MeshNav 无需此输入")
+        elif walking:
+            status = "手柄规划；使用手柄控制行走。"
+        elif self.woosh_control_mode:
+            status = "自动导航；路线预览后点击“开始导航”，需定位和底盘反馈就绪。"
+        else:
+            status = "接入设置已应用；导航后端为 Nav2。"
+        self.action_status.setText(status)
 
     def start_stack(self) -> tuple[bool, str]:
         config = self.configuration()

@@ -36,6 +36,10 @@ def walking_ui(tmp_path, monkeypatch, application):
     node.projected_route = lambda shape: None
     node.remaining_distance = lambda: session.remaining
     view = NavigationWindow(node)
+    access = view.navigation_access_page
+    backend = access.fields["navigation_engine"]
+    backend.setCurrentIndex(backend.findData("nav2"))
+    access.save()
     view.refresh_timer.stop();view.operations_page.timer.stop()
     view._set_local_grid(GridMap(np.zeros((40,40),dtype=np.int8),.2,np.zeros(3)),reset_original=True)
     yield view,client,clock,motion_calls

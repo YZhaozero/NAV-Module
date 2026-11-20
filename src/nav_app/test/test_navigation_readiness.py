@@ -55,11 +55,12 @@ def test_action_visible_inactive_is_not_ready_active_is_required(runtime, backen
     assert not manager.requests
 
 
-def test_robot_requires_planner_controller_and_bt_active(runtime):
+def test_robot_requires_map_planner_controller_and_bt_active(runtime):
     helper,clients,manager,now,located=runtime
     helper.configure('nav2','robot');assert not helper.ready(True,True)
     clients['/planner_server/get_state'].respond(3)
-    clients['/controller_server/get_state'].respond(2)
+    clients['/map_server/get_state'].respond(2)
+    clients['/controller_server/get_state'].respond(3)
     clients['/bt_navigator/get_state'].respond(3)
     assert not helper.ready(True,True)
     now[0]+=.6;helper.ready(True,True)
@@ -147,7 +148,7 @@ def test_real_planning_entry_rejects_discovered_but_inactive_nav2(runtime):
     helper,clients,manager,now,located=runtime
     helper.configure('walking');states(runtime,2,2)
     action=NS(server_is_ready=lambda:True,send_goal_async=lambda *_:pytest.fail('inactive goal sent'))
-    node=NS(_navigation_readiness=helper,navigation_client=action,robot_client=action,_planning_inputs=())
+    node=NS(_navigation_readiness=helper,navigation_client=action,robot_client=action,_planning_inputs=(),_meshnav_active=False)
     node.navigation_route_ready=lambda:QtNavRosNode.navigation_route_ready(node)
     assert not QtNavRosNode.navigation_component_ready(node,'nav2')
     assert not QtNavRosNode.send_navigation_waypoints(node,[[1.,2.]])

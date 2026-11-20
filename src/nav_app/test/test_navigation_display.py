@@ -120,6 +120,39 @@ def test_camera_panel_arrows_clear_on_stale_frame():
     panel.close()
 
 
+
+def test_camera_redraws_on_changed_content_or_freshness_only(application):
+    from nav_app.qt_nav_node import CameraPanel
+
+    class CountingPanel(CameraPanel):
+        def paintEvent(self, event):
+            self.paints += 1
+            super().paintEvent(event)
+
+    panel = CountingPanel(fill=True)
+    panel.paints = 0
+    panel.resize(1600, 900)
+    panel.show()
+    image = np.zeros((360, 640, 3), np.uint8)
+    panel.set_frame(image, None, 0., frame_revision=1)
+    panel.set_frame_age(.1, .1)
+    application.processEvents()
+    before = panel.paints
+    for _ in range(5):
+        panel.set_frame(image, None, 0., frame_revision=1)
+        panel.set_frame_age(.15, .15)
+        application.processEvents()
+    assert panel.paints == before
+    panel.set_frame_age(.7, .7)
+    application.processEvents()
+    assert panel.paints == before + 1 and not panel._camera_live
+    panel.set_frame(image, None, 0., frame_revision=2)
+    panel.set_frame_age(.1, .1)
+    application.processEvents()
+    assert panel.paints == before + 2 and panel._camera_live
+    panel.close()
+
+
 def test_turn_distance_does_not_depend_on_planner_sampling():
     sparse = np.array([[0., 0.], [5., 0.], [5., 5.]])
     dense = np.vstack([np.linspace(a, b, 40, endpoint=False) for a, b in zip(sparse[:-1], sparse[1:])] + [sparse[-1:]])

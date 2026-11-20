@@ -1,0 +1,30 @@
+mbf_mesh_nav:
+  ros__parameters:
+    global_frame: map
+    robot_frame: base_link
+    planners: [surface]
+    surface:
+      type: "dijkstra_mesh_planner/DijkstraMeshPlanner"
+      publish_vector_field: false
+    mesh_map:
+      global_frame: map
+      layers: [border, clearance, slope, drive_cost]
+      default_layer: drive_cost
+      edge_cost_factor: 8.0
+      border:
+        type: "mesh_layers/BorderLayer"
+      clearance:
+        type: "mesh_layers/InflationLayer"
+        inputs: [border]
+        inscribed_radius: 0.30
+        # A soft shoulder biases the search away from corners. Exact acceptance
+        # checks the oriented, padded chassis polygon on the original ground triangles.
+        inflation_radius: 0.80
+        cost_scaling_factor: 1.0
+        inscribed_value: 1.0
+        lethal_value: 1.0
+      drive_cost:
+        type: "mesh_layers/MaxCombinationLayer"
+        inputs: [slope, clearance]
+      slope:
+        type: "mesh_layers/SteepnessLayer"

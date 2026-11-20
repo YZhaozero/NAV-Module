@@ -22,6 +22,8 @@ class MotionGuardNode(Node):
         for name,value in [('max_speed_mps',.3),('max_yaw_rps',.5),('acceleration',.4),('timeout_s',.3)]:self.declare_parameter(name,value)
         self.guard=MotionGuard(max_speed=self.get_parameter('max_speed_mps').value,max_yaw=self.get_parameter('max_yaw_rps').value,
                                acceleration=self.get_parameter('acceleration').value,timeout=self.get_parameter('timeout_s').value)
+        self.base_reason = ''
+        self.base_feedback_stamp = 0
         self.health=LocalizationHealth();qos=QoSProfile(depth=1,reliability=ReliabilityPolicy.BEST_EFFORT)
         self.command=self.create_publisher(String,'/nav/base_command',qos)
         self.status=self.create_publisher(String,'/nav/motion_status',qos)
@@ -47,7 +49,11 @@ class MotionGuardNode(Node):
             row=json.loads(m.data)
             if not isinstance(row,dict):raise ValueError()
             if row.get('schema')!=1 or not self.age_ok(row['stamp_ns']):raise ValueError()
-            self.guard.feedback(row['connected'],row['estop_released'],row['ack_sequence'],row['measured_velocity'])
+            reason = row.get('base_reason', '')
+            if not isinstance(reason, str):raise ValueError()
+            self.base_reason, self.base_feedback_stamp = reason, row['stamp_ns']
+            self.guard.feedback(row['connected'],row['estop_released'],row['ack_sequence'],
+                                row['measured_velocity'], row.get('stop_pending', False))
         except (ValueError,KeyError,TypeError):self.guard.disarm('invalid_base_feedback')
 
     def arm(self,request,response):
@@ -59,7 +65,10 @@ class MotionGuardNode(Node):
     def tick(self):
         self.guard.localization(self.health.valid(self.get_clock().now().nanoseconds))
         state=self.guard.tick();state['stamp_ns']=self.get_clock().now().nanoseconds;state['frame_id']='base_link'
-        msg=String(data=json.dumps(state,allow_nan=False));self.command.publish(msg);self.status.publish(msg)
+        self.command.publish(String(data=json.dumps(state,allow_nan=False)))
+        state['base_reason'] = (self.base_reason if self.age_ok(self.base_feedback_stamp)
+                                else '等待底盘适配器反馈')
+        self.status.publish(String(data=json.dumps(state,allow_nan=False)))
 
 
 def main(args=None):

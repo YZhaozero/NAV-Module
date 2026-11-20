@@ -1,0 +1,13 @@
+repositories:
+  lvr2:
+    type: git
+    url: https://github.com/uos/lvr2.git
+    version: 66562f3b80ebbe176157f36f0e9f1fddbca52f6e
+  mesh_tools:
+    type: git
+    url: https://github.com/naturerobots/mesh_tools.git
+    version: 12e1787bb5034a21a510a6afc3495051966072c7
+  move_base_flex:
+    type: git
+    url: https://github.com/naturerobots/move_base_flex.git
+    version: 5434c21582dd3c6a7e18f9dc0ac308e0c1cb754e

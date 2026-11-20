@@ -1,8 +1,8 @@
-"""Explicit per-robot inputs for the shared Nav2 workflow."""
+"""Persistent input and backend settings for each robot profile."""
 import os
 from PyQt5.QtCore import Qt, QSettings
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
-    QLabel, QPushButton, QComboBox, QLineEdit, QCheckBox, QFrame, QScrollArea)
+    QLabel, QPushButton, QComboBox, QLineEdit, QCheckBox, QFileDialog, QFrame, QScrollArea)
 from .page_header import PageHeader
 from .touch_scroll import enable_touch_scroll
 
@@ -17,7 +17,7 @@ class NavigationAccessPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 16, 22, 18)
         self.header = PageHeader("NAV · 导航接入设置", back, destination="返回导航系统",
-            subtitle="按机器人能力选择输入与处理方式，统一交给 Nav2 导航")
+            subtitle="选择导航后端、传感器输入和定位方式")
         layout.addLayout(self.header)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -39,7 +39,7 @@ class NavigationAccessPage(QWidget):
         preset_button.clicked.connect(lambda: self.load_preset(self.presets.currentData()))
         presets.addWidget(preset_button)
         body.addLayout(presets)
-        self.pipeline = QLabel("传感器与话题   →   里程计与定位   →   Nav2")
+        self.pipeline = QLabel()
         self.pipeline.setStyleSheet("background: #143346; color: #8ee3fa; padding: 14px; border-radius: 9px; font-size: 18px; font-weight: 650;")
         self.pipeline.setWordWrap(True)
         body.addWidget(self.pipeline)
@@ -69,6 +69,9 @@ class NavigationAccessPage(QWidget):
             ("04  地图定位", "每段 TF 只保留一个来源，定位必须与所选地图一致。", [
                 ("localization_backend", "定位来源", [("NAV · 点云 Localizer", "pointcloud_localizer"), ("Nav2 · AMCL", "amcl"), ("使用已有 map→odom TF", "external")])]),
         ]
+        definitions.insert(0, ("导航后端", "", [
+            ("navigation_engine", "规划后端", [("MeshNav · 三维网格", "meshnav"), ("Nav2 · 栅格", "nav2")]),
+            ("meshnav_map", "三角网格 PLY", "")]))
         for title, detail, fields in definitions:
             card = QFrame()
             card.setObjectName("accessCard")
@@ -79,7 +82,8 @@ class NavigationAccessPage(QWidget):
             hint = QLabel(detail)
             hint.setWordWrap(True)
             hint.setStyleSheet("color: #9ab4c5; font-size: 14px;")
-            box.addWidget(hint)
+            if detail:
+                box.addWidget(hint)
             form = QFormLayout()
             form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
             form.setSpacing(10)
@@ -97,8 +101,18 @@ class NavigationAccessPage(QWidget):
                     widget.setMinimumWidth(0)
                     widget.textChanged.connect(self.refresh_summary)
                 self.fields[key] = widget
-                form.addRow(label, widget)
-                self.rows[key] = (form, widget)
+                field = widget
+                if key == "meshnav_map":
+                    widget.setPlaceholderText("留空自动查找同名 .mesh.ply")
+                    browse = QPushButton("选择")
+                    browse.clicked.connect(self.choose_mesh_map)
+                    field = QWidget()
+                    row = QHBoxLayout(field)
+                    row.setContentsMargins(0, 0, 0, 0)
+                    row.addWidget(widget, 1)
+                    row.addWidget(browse)
+                form.addRow(label, field)
+                self.rows[key] = (form, field)
             box.addLayout(form)
             box.addStretch(1)
             self.cards.append(card)
@@ -143,7 +157,8 @@ class NavigationAccessPage(QWidget):
         woosh = key in ("woosh", "woosh_native5")
         external = key == "external"
         prefix = "/foo" if woosh or external else ""
-        return dict(preset=key, lidar_driver_mode="nav" if native5 else ("external" if woosh or external else "nav"),
+        return dict(preset=key, navigation_engine="meshnav" if woosh else "nav2", meshnav_map="",
+            lidar_driver_mode="nav" if native5 else ("external" if woosh or external else "nav"),
             camera_driver_mode="off" if external else ("external" if woosh else "nav"),
             scan_source="convert" if native5 else ("external" if woosh or external else "convert"),
             odometry_backend="external" if external else "fast_livo",
@@ -155,6 +170,13 @@ class NavigationAccessPage(QWidget):
             image_topic="/foo/camera_1/color/image_raw" if woosh else "/camera/camera/color/image_raw",
             scan_topic="/scan" if native5 else prefix + "/scan", external_odom_topic=prefix + "/odom",
             fast_livo_vision=not external, laser_target_frame="base_footprint" if woosh else "base_link")
+
+    def choose_mesh_map(self):
+        field = self.fields["meshnav_map"]
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择三角网格", field.text() or str(self.stack_page.map_storage_dir), "三角网格 (*.ply)")
+        if path:
+            field.setText(path)
 
     def load_preset(self, key):
         self.set_values(self.preset(key))
@@ -178,18 +200,23 @@ class NavigationAccessPage(QWidget):
     def refresh_summary(self, *_):
         value = self.values()
         odom = value["odometry_backend"]
+        mesh = value["navigation_engine"] == "meshnav"
+        backend = self.fields["navigation_engine"].currentText()
+        self.pipeline.setText(f"传感器与话题   →   里程计与定位   →   {backend}")
         visible = dict(external_odom_topic=odom == "external", fast_livo_vision=odom == "fast_livo",
             fast_livo_lidar_topic=odom == "fast_livo",
             woosh_fast_livo_profile=self.profile == "woosh" and odom == "fast_livo",
-            laser_target_frame=value["scan_source"] == "convert",
-            imu_topic=odom != "external", lidar_topic=odom != "external" or value["scan_source"] == "convert",
+            meshnav_map=mesh, scan_source=not mesh, scan_topic=not mesh,
+            laser_target_frame=not mesh and value["scan_source"] == "convert",
+            imu_topic=odom != "external", lidar_topic=mesh or odom != "external" or value["scan_source"] == "convert",
             image_topic=value["camera_driver_mode"] != "off")
         for key, shown in visible.items():
             form, widget = self.rows[key]
             widget.setVisible(shown)
             form.labelForField(widget).setVisible(shown)
-        self.summary.setText("统一导航后端：Nav2\n避障：%s  ·  里程计：%s  ·  定位：%s" % (
-            self.fields["scan_source"].currentText(), self.fields["odometry_backend"].currentText(),
+        self.cards[2].setVisible(not mesh)
+        self.summary.setText("%s\n地图输入：%s  ·  里程计：%s  ·  定位：%s" % (
+            backend, "MeshNav 三维网格" if mesh else self.fields["scan_source"].currentText(), self.fields["odometry_backend"].currentText(),
             self.fields["localization_backend"].currentText()))
 
     def save(self):
@@ -197,10 +224,20 @@ class NavigationAccessPage(QWidget):
         if value["odometry_backend"] == "fast_livo" and value["fast_livo_vision"] and value["camera_driver_mode"] == "off":
             self.status.setText("请提供相机输入，或关闭 FAST-LIVO 视觉。")
             return
-        required = ["scan_topic"]
+        mesh = value["navigation_engine"] == "meshnav"
+        if mesh and value["localization_backend"] == "amcl":
+            self.status.setText("MeshNav 需要点云定位或已有地图 TF，请调整定位来源。")
+            return
+        if mesh and value["meshnav_map"]:
+            from pathlib import Path
+            path = Path(value["meshnav_map"]).expanduser()
+            if path.suffix.lower() != ".ply" or not path.is_file():
+                self.status.setText("请选择存在的 PLY 三角网格文件。")
+                return
+        required = [] if mesh else ["scan_topic"]
         if value["odometry_backend"] == "external": required.append("external_odom_topic")
         else: required += ["fast_livo_lidar_topic" if value["odometry_backend"] == "fast_livo" else "lidar_topic", "imu_topic"]
-        if value["scan_source"] == "convert": required += ["lidar_topic", "laser_target_frame"]
+        if not mesh and value["scan_source"] == "convert": required += ["lidar_topic", "laser_target_frame"]
         if any(not value[key] for key in required):
             self.status.setText("请填写当前组合需要的话题与坐标系。")
             return

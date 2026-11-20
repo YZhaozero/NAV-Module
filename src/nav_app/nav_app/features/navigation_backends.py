@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import re
+import os
 from pathlib import Path
 import shlex
 from typing import Dict, List, Tuple
@@ -208,6 +210,9 @@ class Nav2Backend(LaunchBackend):
             f"autostart:={launch_bool(config.autostart)}",
             f"rviz:={launch_bool(config.nav2_rviz)}",
         ]
+        if config.robot_profile == "woosh" and config.woosh_control_mode:
+            arguments += ["enable_base_control:=true",
+                          f"required_control_mode:={config.woosh_control_mode}"]
         if config.nav2_params.strip():
             argument = "nav2_params_file" if config.robot_profile == "woosh" else "params_file"
             arguments.append(
@@ -235,6 +240,67 @@ class WalkingPlannerBackend(Nav2Backend):
         if config.nav2_params.strip():
             arguments.append(f"params_file:={Path(config.nav2_params).expanduser().resolve()}")
         return arguments
+
+
+class MeshNavBackend(LaunchBackend):
+    key = "meshnav"
+    label = "MeshNav · 三维规划"
+    description = "在三维网格上规划路线；自动行驶使用实时点云避障。"
+
+    @staticmethod
+    def mesh_path(config):
+        if config.meshnav_map:
+            mesh = Path(config.meshnav_map).expanduser()
+            generated = re.fullmatch(r"(.+\.scene)-[0-9a-f]{8}\.mesh\.ply", mesh.name)
+            if generated:
+                manifest = mesh.with_name(generated[1] + ".json")
+                if manifest.is_file():
+                    from ..scene_catalog import read_scene
+                    scene = read_scene(manifest)
+                    if scene.previous_meshnav == str(mesh.resolve()):
+                        return Path(scene.meshnav)
+            return mesh
+        if not config.localization_map:
+            return None
+        pcd = Path(config.localization_map).expanduser()
+        map_dir = os.environ.get("NAV_MESHNAV_MAP_DIR")
+        if map_dir:
+            deployed = Path(map_dir) / pcd.with_suffix(".mesh.ply").name
+            if deployed.is_file():
+                return deployed
+        return pcd.with_suffix(".mesh.ply")
+
+    def validate(self, config):
+        from ament_index_python.packages import PackageNotFoundError, get_package_prefix
+
+        if config.localization_backend not in ("pointcloud_localizer", "external"):
+            return False, "MeshNav 需要点云定位或已有 map→odom TF"
+        if config.meshnav_map_error:
+            return False, config.meshnav_map_error
+        mesh = self.mesh_path(config)
+        if mesh is None or mesh.suffix.lower() != ".ply" or not mesh.is_file():
+            return False, "请在导航接入中选择与定位地图对齐的 PLY 三角网格"
+        try:
+            get_package_prefix("mbf_mesh_nav")
+        except PackageNotFoundError:
+            return False, "MeshNav 未安装或其 ROS 工作区未加载"
+        return True, ""
+
+    def launch_arguments(self, config):
+        from ament_index_python.packages import get_package_share_directory
+
+        mesh = self.mesh_path(config).resolve()
+        woosh = config.robot_profile == "woosh"
+        params = Path(get_package_share_directory("nav_app")) / "config" / ("woosh_meshnav.yaml" if woosh else "meshnav.yaml")
+        cache = ".woosh-octagon-v3.h5" if woosh else ".meshnav.h5"
+        if config.woosh_control_mode:
+            return ["launch", "nav_app", "woosh_mesh_drive.launch.py", f"mesh:={mesh}",
+                    f"params:={params}", f"control_mode:={config.woosh_control_mode}"]
+        return ["run", "mbf_mesh_nav", "mbf_mesh_nav", "--ros-args",
+                "--params-file", str(params),
+                "-p", f"mesh_map.mesh_file:={mesh}",
+                "-p", f"mesh_map.mesh_working_file:={mesh}{cache}",
+                "-p", f"use_sim_time:={launch_bool(config.use_sim_time)}"]
 
 
 class ScanPlannerBackend(LaunchBackend):
@@ -341,6 +407,7 @@ NAVIGATION_BACKENDS: Dict[str, LaunchBackend] = {
     backend.key: backend for backend in (
         Nav2Backend(),
         WalkingPlannerBackend(),
+        MeshNavBackend(),
         ScanPlannerBackend(),
         CustomNavigationBackend(),
     )

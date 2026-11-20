@@ -53,6 +53,10 @@ def scene_assets(scene, kind: str = "package") -> tuple[Path, ...]:
         scene, "scan_context", ""
     ):
         paths.append(Path(scene.scan_context).expanduser().resolve())
+    if kind == "package" and getattr(scene, "meshnav", ""):
+        paths.append(Path(scene.meshnav).expanduser().resolve())
+        if getattr(scene, "previous_meshnav", ""):
+            paths.append(Path(scene.previous_meshnav))
     return tuple(dict.fromkeys(paths))
 
 

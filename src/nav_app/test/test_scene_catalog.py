@@ -71,7 +71,7 @@ def test_v2_bundle_tracks_optional_verified_scan_context(tmp_path):
     )))
     scene = read_scene(manifest)
     assert scene.ready and scene.global_ready
-    assert scene.resource_summary == "PCD ✓ · 栅格 ✓ · SC ✓"
+    assert scene.resource_summary == "PCD ✓ · 栅格 ✓ · SC ✓ · MeshNav 待生成"
 
 
 def test_rename_scene_only_changes_display_title(tmp_path):

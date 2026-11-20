@@ -49,6 +49,8 @@ class NavigationStackConfig:
     localization_map: str
     localization_backend: str = "pointcloud_localizer"
     navigation_backend: str = "nav2"
+    meshnav_map: str = ""
+    meshnav_map_error: str = ""
     lidar_arguments: Sequence[str] = field(default_factory=tuple)
     camera_arguments: Sequence[str] = field(default_factory=tuple)
     sensor_source: str = "live"
@@ -59,6 +61,7 @@ class NavigationStackConfig:
     use_sim_time: bool = False
     autostart: bool = True
     robot_profile: str = ""
+    woosh_control_mode: int = 0
     odometry_backend: str = "dlio"
     fast_livo_lidar_topic: str = "/livox/lidar"
     fast_livo_image_topic: str = "/camera/camera/color/image_raw"
@@ -117,13 +120,20 @@ class NavigationStackConfig:
     startup_interval_ms: int = 1000
     sensor_timeout_s: float = 12.0
 
+    @property
+    def mesh_cloud_topic(self):
+        if self.woosh_fast_livo_profile == "native5":
+            return "/nav/livox5/points_filtered"
+        return self.dlio_pointcloud_topic.strip()
+
 
 def navigation_input_modes(config):
     """Resolve saved explicit choices or the existing robot preset."""
     woosh = config.robot_profile == "woosh"
     return dict(lidar=("external" if woosh else "nav") if config.lidar_driver_mode == "profile" else config.lidar_driver_mode,
                 camera=("external" if woosh else "nav") if config.camera_driver_mode == "profile" else config.camera_driver_mode,
-                scan=("external" if woosh else "convert") if config.scan_source == "profile" else config.scan_source)
+                scan="off" if config.navigation_backend == "meshnav" else
+                (("external" if woosh else "convert") if config.scan_source == "profile" else config.scan_source))
 
 
 def validate_navigation_stack(config: NavigationStackConfig, *, cancelled=None, progress=None) -> Tuple[bool, str]:
@@ -131,7 +141,8 @@ def validate_navigation_stack(config: NavigationStackConfig, *, cancelled=None, 
     modes = navigation_input_modes(config)
     for key, choices in (("lidar", ("nav", "external")),
                          ("camera", ("nav", "external", "off")),
-                         ("scan", ("external", "convert"))):
+                         ("scan", ("external", "convert", "off") if config.navigation_backend == "meshnav"
+                          else ("external", "convert"))):
         if modes[key] not in choices:
             return False, f"未知接入选项：{key}"
     if config.navigation_backend in ("nav2", "walking") and not config.scan_topic.strip():
@@ -142,6 +153,15 @@ def validate_navigation_stack(config: NavigationStackConfig, *, cancelled=None, 
         return False, "FAST-LIVO 视觉已启用，请选择相机输入或关闭视觉"
     if config.robot_profile not in ("", "woosh"):
         return False, "未知机器人接入配置"
+    if config.woosh_control_mode and (
+        config.woosh_control_mode not in (1, 2)
+        or config.robot_profile != "woosh"
+        or config.navigation_backend not in ("nav2", "meshnav")
+        or (config.navigation_backend == "meshnav" and not config.mesh_cloud_topic)
+        or config.localization_backend != "pointcloud_localizer"
+        or config.sensor_source != "live" or config.use_sim_time
+    ):
+        return False, "WOOSH 底盘执行需要实机点云定位，以及所选导航后端的实时避障输入"
     if config.robot_profile == "woosh":
         if config.woosh_fast_livo_profile not in ("livox3", "native5"):
             return False, "未知 WOOSH 雷达安装配置"
@@ -309,7 +329,7 @@ def build_navigation_launches(
     for key in ("lidar", "camera"):
         if modes[key] != "nav":
             launches.pop(key, None)
-    if modes["scan"] == "external":
+    if modes["scan"] in ("external", "off"):
         launches.pop("laserscan", None)
     if config.odometry_backend == "external":
         launches.pop("dlio", None)
@@ -413,8 +433,11 @@ class NavigationStackController(QObject):
         if config.odometry_backend == "fast_livo" and config.fast_livo_vision:
             self._required_sensors.add("camera")
         self._external_inputs = {}
-        if config.navigation_backend in ("nav2", "walking") and config.sensor_source == "live":
-            self._external_inputs["scan"] = "LaserScan " + config.scan_topic
+        if (config.navigation_backend in ("nav2", "walking") or config.woosh_control_mode) and config.sensor_source == "live":
+            if config.navigation_backend != "meshnav":
+                self._external_inputs["scan"] = "LaserScan " + config.scan_topic
+            # MeshDrive handles cloud freshness at the motion gate. A cloud outage
+            # must leave the confirmed route available for an explicit restart.
             if config.odometry_backend == "external":
                 self._external_inputs["external_odom"] = "已有里程计 " + config.external_odom_topic + " 及 odom→base_link TF"
             if config.localization_backend == "external":
@@ -425,7 +448,7 @@ class NavigationStackController(QObject):
             set() if config.sensor_source == "bag" or config.odometry_backend == "external" else {"dlio"})
         if config.localization_backend == "pointcloud_localizer":
             self._readiness_components.add("localizer")
-        if config.sensor_source == "live" and config.navigation_backend in ("nav2", "walking"):
+        if config.sensor_source == "live" and config.navigation_backend in ("nav2", "walking", "meshnav"):
             self._readiness_components.add("nav2")
         self._launches = build_navigation_launches(config)
         self._queue = [key for key in START_ORDER if key in self._launches]
@@ -601,7 +624,7 @@ class NavigationStackController(QObject):
             self.states[key] = "running"
             self.component_state_changed.emit(key, "running")
             self._later(self._startup_interval_ms, self._start_next)
-        elif time.monotonic() >= deadline and self.active_config.navigation_backend == "walking":
+        elif time.monotonic() >= deadline and self.active_config.navigation_backend in ("walking", "meshnav"):
             message = ("等待地图定位，请点击重新定位；已启动的组件继续运行"
                        if key == "localizer" else f"等待{COMPONENT_LABELS[key]}有效数据；已启动的组件继续运行")
             if message != self._waiting_input_message:
@@ -730,7 +753,7 @@ class NavigationStackController(QObject):
             return
         if self._sensor_source == "bag":
             return
-        if self.active_config is not None and self.active_config.navigation_backend == "walking":
+        if self.active_config is not None and self.active_config.navigation_backend in ("walking", "meshnav"):
             checks = [(key, self.sensor_active(key), COMPONENT_LABELS[key]) for key in self._required_sensors]
             if self.component_ready is not None:
                 checks += [(key, self.component_ready(key), COMPONENT_LABELS[key])
@@ -743,7 +766,7 @@ class NavigationStackController(QObject):
                     if self.states[key] != state:
                         self.states[key] = state
                         self.component_state_changed.emit(key, state)
-            message = "等待数据：" + "、".join(missing) + "；路线规划已暂停" if missing else "路线规划已就绪；使用手柄控制行走"
+            message = "等待数据：" + "、".join(missing) + "；路线规划已暂停" if missing else ("路线规划已就绪；确认路线后可自动行驶" if self.active_config.woosh_control_mode else "路线规划已就绪；使用手柄控制行走")
             if message != self._waiting_input_message:
                 self._waiting_input_message = message
                 self._record_log("system", message + "\n")

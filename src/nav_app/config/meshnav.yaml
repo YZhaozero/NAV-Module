@@ -1,0 +1,15 @@
+mbf_mesh_nav:
+  ros__parameters:
+    global_frame: map
+    robot_frame: base_link
+    planners: [surface]
+    surface:
+      type: "dijkstra_mesh_planner/DijkstraMeshPlanner"
+      publish_vector_field: false
+    mesh_map:
+      global_frame: map
+      layers: [slope]
+      default_layer: slope
+      edge_cost_factor: 1.0
+      slope:
+        type: "mesh_layers/SteepnessLayer"

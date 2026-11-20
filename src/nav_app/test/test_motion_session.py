@@ -27,3 +27,22 @@ def test_stop_is_never_inferred_from_cancel_and_arm_timeout_fails():
     now[0]=3.1;assert '超时' in s.poll(1,True);assert '等待' in s.stop_text()
     for text in ('[]','null','false','{}','x'*2100):
         s.update(text);assert not s.available()
+
+
+def test_feedback_age_includes_transport_delay_and_recovers_only_on_valid_frame():
+    now = [10.]
+    session = MotionSession(SimpleNamespace(service_is_ready=lambda: True), lambda: None, lambda: now[0])
+    row = dict(schema=1, armed=True, base_connected=True, stamp_ns=9_750_000_000)
+    session.update(json.dumps(row), 10_000_000_000)
+    assert session.available()
+    now[0] += .06
+    assert not session.fresh() and "310 毫秒" in session.unavailable_reason()
+    session.update(json.dumps(row), 10_060_000_000)
+    assert "时间戳" in session.unavailable_reason()
+    row.update(stamp_ns=10_060_000_000, base_connected=False, base_reason="底盘服务离线")
+    session.update(json.dumps(row), row["stamp_ns"])
+    assert session.unavailable_reason() == "底盘服务离线"
+    row.update(base_connected=True, armed=False, reason="permit_timeout")
+    session.update(json.dumps(row), row["stamp_ns"])
+    session.generation, session.armed = 1, True
+    assert session.available() and "行驶许可超时" in session.poll(1, True)

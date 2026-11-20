@@ -16,6 +16,7 @@ from ..scene_catalog import discover_scenes, rename_scene, normalize_scene_title
 from ..map_processing import load_grid_map
 from ..features.map_library import prepare_map_deletion, delete_map
 from ..features.navigation_bundle import build
+from ..features.meshnav_maps import generate_scene_mesh, load_mesh_surface
 from ..features.capture_quality import atomic_json
 from ..features.localization_tools import validate_scan_context_cache
 from ..features.log_store import log_store
@@ -44,7 +45,7 @@ class MapLibraryPage(QWidget):
         self.root = window.map_storage_dir
         self.worker = BackgroundTask(self)
         self.preview_worker = BackgroundTask(self)
-        self._preview_loaded = dict(cloud=None, grid=None)
+        self._preview_loaded = dict(cloud=None, grid=None, meshnav=None)
         self._preview_request = None
         self._pending_preview = None
         self._editing_manifest = None
@@ -71,7 +72,7 @@ class MapLibraryPage(QWidget):
         for index, (text, callback) in enumerate([
                 ('刷新', self.refresh), ('新地图包', self.new_bundle), ('保存地图包', self.register),
                 ('从 PCD 生成', self.generate), ('用于导航', self.load), ('核对坐标', self.verify),
-                ('改名', self.rename), ('删除', self.delete)]):
+                ('改名', self.rename), ('删除', self.delete), ('生成 MeshNav 网格', self.generate_mesh)]):
             button = QPushButton(text)
             button.setObjectName('dangerButton' if text == '删除' else
                                  'primaryButton' if text in ('保存地图包', '用于导航') else 'secondaryButton')
@@ -85,8 +86,10 @@ class MapLibraryPage(QWidget):
         self.bundle_title = QLineEdit()
         form.addRow('地图包名称', self.bundle_title)
         self.cloud_file, self.sc_file, self.grid_file = QLineEdit(), QLineEdit(), QLineEdit()
-        self.asset_fields = dict(cloud=self.cloud_file, scan_context=self.sc_file, grid=self.grid_file)
-        for kind, title in [('cloud', 'PCD 点云'), ('scan_context', 'SC 索引'), ('grid', '栅格地图')]:
+        self.mesh_file = QLineEdit()
+        self.asset_fields = dict(cloud=self.cloud_file, scan_context=self.sc_file, grid=self.grid_file, meshnav=self.mesh_file)
+        for kind, title in [('cloud', 'PCD 点云'), ('scan_context', 'SC 索引'),
+                            ('grid', '栅格地图'), ('meshnav', 'MeshNav 网格')]:
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
@@ -96,15 +99,17 @@ class MapLibraryPage(QWidget):
             row_layout.addWidget(browse)
             if kind != 'scan_context':
                 preview = QPushButton('查看')
-                preview.clicked.connect(lambda _=False, key=kind: self.open_asset(key))
-                process = QPushButton('处理')
-                process.clicked.connect(lambda _=False, key=kind: self.open_asset(key, edit=True))
                 row_layout.addWidget(preview)
-                row_layout.addWidget(process)
+                preview.clicked.connect(lambda _=False, key=kind: self.open_asset(key))
+                if kind != "meshnav":
+                    process = QPushButton('处理')
+                    process.clicked.connect(lambda _=False, key=kind: self.open_asset(key, edit=True))
+                    row_layout.addWidget(process)
             form.addRow(title, row)
+        self.mesh_file.setPlaceholderText("选择已有 PLY 或生成")
         assets_layout.addLayout(form)
-        self.coordinates_verified = QCheckBox('已核对 PCD 与栅格的坐标、方向和比例')
-        for field in (self.cloud_file, self.grid_file):
+        self.coordinates_verified = QCheckBox('已核对 PCD、栅格和所选网格的坐标、方向和比例')
+        for field in (self.cloud_file, self.grid_file, self.mesh_file):
             field.textChanged.connect(lambda _: self.coordinates_verified.setChecked(False))
         assets_layout.addWidget(self.coordinates_verified)
         self.preview_tabs = QTabWidget()
@@ -112,11 +117,15 @@ class MapLibraryPage(QWidget):
         self.cloud_preview = panel_factory(cloud_3d=True)
         self.cloud_preview.set_display_mode('cloud')
         self.cloud_preview.set_cloud_display_options('original', 'XYZ', (False,)*3, 'orthographic', 'height')
+        from ..qt_nav_node import MeshPreviewPanel
         self.grid_preview = panel_factory()
-        for panel in (self.cloud_preview, self.grid_preview):
+        self.mesh_preview = MeshPreviewPanel()
+        self.preview_panels = dict(cloud=self.cloud_preview, grid=self.grid_preview, meshnav=self.mesh_preview)
+        for panel in self.preview_panels.values():
             panel.setMinimumSize(160, 120)
         self.preview_tabs.addTab(self.cloud_preview, '点云预览')
         self.preview_tabs.addTab(self.grid_preview, '栅格预览')
+        self.preview_tabs.addTab(self.mesh_preview, 'Mesh 网格')
         assets_layout.addWidget(self.preview_tabs, 1)
         scroll = QScrollArea()
         self.asset_scroll = scroll
@@ -126,11 +135,11 @@ class MapLibraryPage(QWidget):
         self.splitter.setSizes([300, 800])
         self.splitter.setStretchFactor(1, 1)
         layout.addWidget(self.splitter, 1)
-        self.status = QLabel('分别选择 PCD、SC 和栅格；查看可预览，处理可进入地图处理页。')
+        self.status = QLabel('选择 PCD、SC、栅格和 MeshNav 网格；点击「查看」预览。')
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.preview_tabs.currentChanged.connect(self.request_preview)
-        for kind in ('cloud', 'grid'):
+        for kind in ('cloud', 'grid', 'meshnav'):
             self.asset_fields[kind].editingFinished.connect(lambda key=kind: self.open_asset(key))
         self.refresh()
 
@@ -171,11 +180,13 @@ class MapLibraryPage(QWidget):
         for field in self.asset_fields.values():
             field.clear()
         self.coordinates_verified.setChecked(False)
-        self._preview_loaded = dict(cloud=None, grid=None)
+        self.mesh_file.setPlaceholderText("选择已有 PLY 或生成")
+        self._preview_loaded = dict(cloud=None, grid=None, meshnav=None)
         self._pending_preview = None
         self.cloud_preview.set_pointcloud(None)
         self.grid_preview.set_map(None, (0., 0.), 0., 0.)
-        self.status.setText('选择地图包后自动预览；也可分别选择 PCD 或栅格文件。')
+        self.mesh_preview.set_mesh(None)
+        self.status.setText('选择地图包后自动预览；也可分别选择 PCD、栅格或 PLY 网格。')
 
     def select_bundle(self, index):
         if index < 0:
@@ -186,36 +197,42 @@ class MapLibraryPage(QWidget):
         self.cloud_file.setText(scene.cloud)
         self.sc_file.setText(scene.scan_context)
         self.grid_file.setText(scene.grid)
+        self.mesh_file.setText(scene.meshnav if not scene.meshnav_error else "")
+        self.mesh_file.setPlaceholderText(scene.meshnav_error or "选择已有 PLY 或生成")
         self.coordinates_verified.setChecked(scene.verified)
-        self._preview_loaded = dict(cloud=None, grid=None)
+        self._preview_loaded = dict(cloud=None, grid=None, meshnav=None)
         self.cloud_preview.set_pointcloud(None)
         self.grid_preview.set_map(None, (0., 0.), 0., 0.)
+        self.mesh_preview.set_mesh(None)
         if self.isVisible():
             self.request_preview(force=True)
 
     def choose_asset(self, kind):
         filters = dict(cloud='PCD 点云 (*.pcd)', scan_context='Scan Context (*.sc.v2)',
-                       grid='栅格地图 (*.yaml *.yml *.pgm)')
+                       grid='栅格地图 (*.yaml *.yml *.pgm)', meshnav='三角网格 (*.ply)')
         field = self.asset_fields[kind]
         path, _ = QFileDialog.getOpenFileName(self, '选择地图文件', field.text() or str(self.root), filters[kind])
         if path:
             field.setText(path)
-            if kind in ('cloud', 'grid'):
+            if kind in self.preview_panels:
                 self.open_asset(kind)
 
     def request_preview(self, _index=None, *, force=False):
         if not force and not self.isVisible():
             return
-        kind = 'cloud' if self.preview_tabs.currentWidget() is self.cloud_preview else 'grid'
+        kind = tuple(self.preview_panels)[self.preview_tabs.currentIndex()]
         path = self.asset_fields[kind].text().strip()
         if not path:
             self._pending_preview = None
             self._preview_loaded[kind] = None
             if kind == 'cloud':
                 self.cloud_preview.set_pointcloud(None)
-            else:
+            elif kind == 'grid':
                 self.grid_preview.set_map(None, (0., 0.), 0., 0.)
-            self.status.setText('请先选择 PCD 点云' if kind == 'cloud' else '请先选择栅格地图')
+            else:
+                self.mesh_preview.set_mesh(None)
+            self.status.setText({'cloud': '请先选择 PCD 点云', 'grid': '请先选择栅格地图',
+                                 'meshnav': '请先选择或生成 MeshNav 网格'}[kind])
             return
         request = (kind, path)
         if not force and self._preview_loaded[kind] == path:
@@ -237,17 +254,21 @@ class MapLibraryPage(QWidget):
         self._preview_loaded[kind] = None
         if kind == 'cloud':
             self.cloud_preview.set_pointcloud(None)
-        else:
+        elif kind == 'grid':
             self.grid_preview.set_map(None, (0., 0.), 0., 0.)
-        self.status.setText('正在加载点云预览…' if kind == 'cloud' else '正在加载栅格预览…')
-        from ..map_processing import load_grid_map, load_pointcloud
+        else:
+            self.mesh_preview.set_mesh(None)
+        self.status.setText("正在加载预览…")
+        from ..map_processing import load_pointcloud
+        loaders = dict(cloud=lambda path: load_pointcloud(path, max_points=300000),
+                       grid=load_grid_map, meshnav=load_mesh_surface)
         self.preview_worker.start(
-            lambda: load_pointcloud(path, max_points=300000) if kind == 'cloud' else load_grid_map(path),
+            lambda: loaders[kind](path),
             lambda value, error: self.preview_finished(kind, path, value, error))
 
     def preview_finished(self, kind, path, value, error):
         self._preview_request = None
-        active = 'cloud' if self.preview_tabs.currentWidget() is self.cloud_preview else 'grid'
+        active = tuple(self.preview_panels)[self.preview_tabs.currentIndex()]
         if kind == active and self.asset_fields[kind].text().strip() == path:
             if error:
                 self.status.setText(f'预览读取失败：{path}；{error}')
@@ -259,7 +280,7 @@ class MapLibraryPage(QWidget):
     def open_asset(self, kind, edit=False):
         if not edit:
             self.preview_tabs.blockSignals(True)
-            self.preview_tabs.setCurrentWidget(self.cloud_preview if kind == 'cloud' else self.grid_preview)
+            self.preview_tabs.setCurrentWidget(self.preview_panels[kind])
             self.preview_tabs.blockSignals(False)
             self.request_preview(force=True)
             return
@@ -293,9 +314,12 @@ class MapLibraryPage(QWidget):
         elif kind == 'cloud':
             self.cloud_preview.set_pointcloud(value.points, colors=value.colors, color_source=value.color_source)
             self.preview_tabs.setCurrentWidget(self.cloud_preview)
-        else:
+        elif kind == 'grid':
             self.grid_preview.set_map(value.occupancy, value.origin[:2], value.resolution, value.origin[2])
             self.preview_tabs.setCurrentWidget(self.grid_preview)
+        else:
+            self.mesh_preview.set_mesh(value)
+            self.preview_tabs.setCurrentWidget(self.mesh_preview)
         self.status.setText(f'已打开：{path}')
         if not edit:
             QTimer.singleShot(0, lambda: self.asset_scroll.ensureWidgetVisible(self.preview_tabs, 0, 0))
@@ -332,6 +356,13 @@ class MapLibraryPage(QWidget):
             if sc:
                 sc = str(Path(sc).expanduser().resolve(strict=True))
             confirmed = self.coordinates_verified.isChecked()
+            mesh = self.mesh_file.text().strip()
+            if mesh:
+                mesh = Path(mesh).expanduser().resolve(strict=True)
+                if mesh.suffix.lower() != ".ply" or not mesh.is_file():
+                    raise ValueError("请选择有效的 PLY 三角网格文件")
+                if not confirmed:
+                    raise ValueError("请先核对网格与 PCD、栅格的坐标、方向和比例")
             root = self.root.resolve()
             manifest = self._editing_manifest or root / f'{uuid.uuid4().hex}.scene.json'
         except (OSError, ValueError) as exc:
@@ -352,9 +383,24 @@ class MapLibraryPage(QWidget):
                        or (base / document.get('grid', '')).resolve() != grid)
             if changed:
                 document.pop('generated', None)
+                document.pop('meshnav', None)
             document.update(version=2, title=title, cloud=os.path.relpath(cloud, base),
                 grid=os.path.relpath(grid, base), frame='map', coordinates_verified=confirmed,
                 scan_context=os.path.relpath(sc, base) if sc else '', scan_context_verified=bool(sc))
+            if mesh:
+                bound = document.get("meshnav", {})
+                cloud_info = cloud.stat()
+                entry = dict(file=os.path.relpath(mesh, base), pcd_size=cloud_info.st_size,
+                             pcd_mtime_ns=cloud_info.st_mtime_ns)
+                active = dict(bound, file=bound.get("physical_v2") or bound.get("file"))
+                if any(active.get(key) != value for key, value in entry.items()):
+                    load_mesh_surface(mesh)
+                    latest = cloud.stat()
+                    if (latest.st_size, latest.st_mtime_ns) != (cloud_info.st_size, cloud_info.st_mtime_ns):
+                        raise ValueError("核对期间定位点云已变化，请重新选择网格")
+                    document["meshnav"] = entry
+            else:
+                document.pop("meshnav", None)
             base.mkdir(parents=True, exist_ok=True)
             atomic_json(manifest, document)
             return str(manifest)
@@ -400,6 +446,36 @@ class MapLibraryPage(QWidget):
         self.refresh()
         self.status.setText(error if error else f"已生成 {result['scene']}；{result.get('warning', '')}；上车前请检查通行区域")
 
+    def generate_mesh(self):
+        if not self.available():
+            return
+        try:
+            scene = self.selected()
+            if not scene.manifest or not scene.ready:
+                raise ValueError("请先保存并核对地图包，再生成 MeshNav 网格")
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return
+        self.status.setText("正在从已保存的 PCD 提取多高度可通行面并生成 MeshNav 网格…")
+        self.worker.start(lambda: generate_scene_mesh(scene.manifest), self.mesh_generated)
+
+    def mesh_generated(self, scene, error):
+        if error:
+            self.status.setText("MeshNav 网格生成失败：" + error)
+            return
+        self.refresh(preserve_edits=True)
+        if self._editing_manifest == scene.manifest:
+            self.mesh_file.blockSignals(True)
+            self.mesh_file.setText(scene.meshnav)
+            self.mesh_file.blockSignals(False)
+            self.open_asset("meshnav")
+        page = self.window.navigation_stack_page
+        if page.localization_map.text() == scene.cloud and page.navigation_map.text() == scene.grid:
+            if page.meshnav_scene is None or page.meshnav_scene.meshnav != scene.meshnav:
+                self.window.clear_selection()
+            page.meshnav_scene = scene
+        self.status.setText(f"三维 MeshNav 网格已关联至「{scene.title}」，可点击「用于导航」。")
+
     def load(self):
         if not self.available():
             return
@@ -419,12 +495,20 @@ class MapLibraryPage(QWidget):
                     raise ValueError(reason)
             grid = load_grid_map(scene.grid)
             page = self.window.navigation_stack_page
+            if page.meshnav_scene is None or page.meshnav_scene.manifest != scene.manifest:
+                self.window.clear_selection()
             page.localization_map.setText(scene.cloud)
             page.navigation_map.setText(scene.grid)
             page.scan_context_map.setText(scene.scan_context)
+            page.meshnav_scene = scene
+            self.window.navigation_mesh_path = None
+            self.window.navigation_mesh_preview = None
+            self.window.navigation_mesh_panel.set_mesh(None)
             if not self.window.load_navigation_localization_map(scene.cloud):
                 raise ValueError('定位地图预览加载失败，请查看地图处理页')
             self.window._set_local_grid(grid, reset_original=True)
+            if self.window.mesh_mode_button.isChecked():
+                self.window.set_navigation_map_mode("mesh")
             self.window.node.grid_frame = grid.frame_id
             self.status.setText(f'已选择 {scene.title}；返回系统首页，点击进入导航即可启动')
         except (OSError, ValueError) as exc:
@@ -440,7 +524,7 @@ class MapLibraryPage(QWidget):
             from ..map_processing import load_grid_map, load_pointcloud
             load_grid_map(scene.grid)
             load_pointcloud(scene.cloud)
-            if QMessageBox.question(self, '核对地图坐标', '已核对 PCD 与栅格使用相同 map 原点、方向和比例？',
+            if QMessageBox.question(self, '核对地图坐标', '已核对 PCD、栅格和已关联的网格使用相同 map 原点、方向和比例？',
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
                 document = json.loads(scene.manifest.read_text())
                 document['coordinates_verified'] = True
@@ -799,6 +883,9 @@ class OperationsController(QObject):
         return ''
 
     def navigation_admission(self):
+        manual = self.window.manual_drive_page.policy
+        if manual.armed or manual.pending is not None or manual.stop_pending is not None:
+            return False, '请先结束底盘遥控并等待零速回执'
         if self.window.mapping_controller.process.active:
             return False, '请先停止建图'
         if self.controller.playing and self.pending_replay != 'navigation':
